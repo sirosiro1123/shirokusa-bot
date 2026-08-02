@@ -1,6 +1,18 @@
+import os
 import discord
 from discord.ext import commands
 from discord import app_commands
+
+from vc_notice import (
+    setup_vc_notice,
+    build_notice_embed,
+    build_notice_view,
+    ReportModal,
+    ReportView,
+    REPORT_MODE,
+    REPORT_TICKET_URL,
+    _effective_mode,
+)
 
 # ==============================
 # チャンネルID設定
@@ -41,7 +53,11 @@ TOURNAMENT     = "https://discord.com/channels/1194515135071539210/1513219971281
 # ==============================
 intents = discord.Intents.default()
 intents.message_content = True
+intents.voice_states = True          # ← VC入退室の検知に必要（追加）
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# VC入室時の注意事項機能を登録（追加）
+setup_vc_notice(bot)
 
 # ==============================
 # メインメニューView
@@ -107,6 +123,12 @@ def vc_embed():
         inline=False)
     e.add_field(name="🎉 イベントVC",
         value=f"[イベントVC]({VC_EVENT})\nサーバーイベントや大会開催時に使用します",
+        inline=False)
+    e.add_field(name="📺 配信のルール",
+        value="**1つのVCにつき配信は1人まで**です。\n2人目が配信したい場合は、先に配信している人の\n**許可を取ってから**お願いします。\n許可が取れれば2配信までOKです！",
+        inline=False)
+    e.add_field(name="📝 入室時の注意事項について",
+        value="VCに入ると、チャット欄に注意事項が自動で表示されます。\n（5分で自動的に消えます）\n\nルール違反を見かけたら `/通報` からいつでも運営に報告できます。",
         inline=False)
     e.set_footer(text="◀️ 戻るボタンでメニューに戻れます")
     return e
@@ -198,6 +220,49 @@ def command_embed():
 async def guide(interaction: discord.Interaction):
     await interaction.response.send_message(embed=main_embed(), view=MainMenuView(), ephemeral=True)
 
+
+@bot.tree.command(name="vc注意事項プレビュー", description="VC入室時に表示される注意事項を自分だけに表示して確認します")
+async def preview_notice(interaction: discord.Interaction):
+    await interaction.response.send_message(embed=build_notice_embed(), ephemeral=True)
+
+
+@bot.tree.command(name="vc注意事項を出す", description="今いるボイスチャンネルに注意事項を手動で表示します")
+async def post_notice(interaction: discord.Interaction):
+    if interaction.user.voice is None or interaction.user.voice.channel is None:
+        await interaction.response.send_message(
+            "先にボイスチャンネルに入ってから実行してください。", ephemeral=True
+        )
+        return
+
+    channel = interaction.user.voice.channel
+    view = build_notice_view()
+    if view is not None:
+        await channel.send(embed=build_notice_embed(), view=view)
+    else:
+        await channel.send(embed=build_notice_embed())
+    await interaction.response.send_message(
+        f"{channel.name} に表示しました。", ephemeral=True
+    )
+
+
+@bot.tree.command(name="通報", description="ルール違反を運営に報告します（内容は他の人に見えません）")
+async def report(interaction: discord.Interaction):
+    mode = _effective_mode()
+    if mode == "form":
+        await interaction.response.send_modal(ReportModal())
+    elif mode == "ticket":
+        await interaction.response.send_message(
+            "ルール違反の報告は意見箱で受け付けています。\n"
+            f"{REPORT_TICKET_URL} からチケットを作成してください。\n"
+            "チケット内のやり取りは、運営とあなたにしか見えません。",
+            ephemeral=True,
+        )
+    else:
+        await interaction.response.send_message(
+            "現在この機能は準備中です。お手数ですが、しろくさへ直接ご連絡ください。",
+            ephemeral=True,
+        )
+
 # ==============================
 # 起動処理
 # ==============================
@@ -207,11 +272,11 @@ async def on_ready():
     print(f"✅ BOT起動完了: {bot.user}")
     bot.add_view(MainMenuView())
     bot.add_view(BackView())
+    bot.add_view(ReportView())
 
 # ==============================
 # トークン（環境変数から読み込む）
 # ==============================
-import os
 token = os.environ.get("DISCORD_TOKEN")
 if not token:
     print("❌ DISCORD_TOKENが設定されていません")
