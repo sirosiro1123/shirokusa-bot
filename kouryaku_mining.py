@@ -230,7 +230,8 @@ async def judge_batch(
                 results = parse_json_array(raw)
                 if results:
                     return results
-            except Exception:
+except Exception as e:
+                print(f"⚠️ API判定エラー (attempt {attempt+1}): {type(e).__name__}: {e}")
                 await asyncio.sleep(2 ** attempt)
     return []
 
