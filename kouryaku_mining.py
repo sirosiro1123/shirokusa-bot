@@ -2,7 +2,7 @@
 kouryaku_mining.py
 クラス別雑談チャンネル等の過去ログから、攻略情報として使えそうな発言を抽出する
 
-- 直近30日分をスキャン
+- 指定日数分をスキャン
 - ノイズを事前除去したうえで Claude API で価値判定
 - スコア順にCSV化し、実行者にDM送付
 
@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import traceback
 from datetime import datetime, timedelta, timezone
 
 import discord
@@ -23,8 +24,10 @@ from discord.ext import commands
 
 try:
     from anthropic import AsyncAnthropic
-except ImportError:  # ライブラリ未導入時に起動を止めない
+    ANTHROPIC_IMPORT_ERROR = None
+except Exception as _e:  # ライブラリ未導入時に起動を止めない
     AsyncAnthropic = None
+    ANTHROPIC_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
 
 # ==============================
@@ -51,7 +54,7 @@ TARGET_CHANNELS = {
 DEFAULT_LOOKBACK_DAYS = 30
 
 # 事前フィルタ
-MIN_LENGTH = 25           # これ未満の文字数は除外
+MIN_LENGTH = 15           # これ未満の文字数は除外（日本語向けに緩和）
 MAX_LENGTH = 1500         # 長すぎる投稿は切り詰め
 
 # API設定
@@ -73,7 +76,7 @@ NOISE_PATTERNS = [
 ]
 
 SYSTEM_PROMPT = """あなたはシャドウバース：ワールズビヨンドのコミュニティ運営を補助するアシスタントです。
-Discordの雑談チャンネルの発言を読み、攻略記事の материал として使えるかを判定してください。
+Discordの雑談チャンネルの発言を読み、攻略記事の材料として使えるかを判定してください。
 
 各発言に対して、以下を出力してください。
 
@@ -131,15 +134,21 @@ def clean_content(msg: discord.Message) -> str:
 
 async def collect_messages(
     guild: discord.Guild, lookback_days: int
-) -> list[dict]:
-    """対象チャンネルから候補メッセージを収集"""
+) -> tuple[list[dict], list[str]]:
+    """
+    対象チャンネルから候補メッセージを収集
+    戻り値: (候補リスト, 診断メッセージのリスト)
+    """
     after = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     collected: list[dict] = []
+    diagnostics: list[str] = []
     seq = 0
+    total_scanned = 0
 
     for ch_id, ch_label in TARGET_CHANNELS.items():
         channel = guild.get_channel(ch_id)
         if channel is None:
+            diagnostics.append(f"{ch_label}: チャンネルが見つかりません")
             continue
 
         targets: list[discord.abc.Messageable] = [channel]
@@ -147,23 +156,31 @@ async def collect_messages(
         if isinstance(channel, discord.TextChannel):
             targets.extend(channel.threads)
 
+        ch_scanned = 0
+        ch_kept = 0
+        ch_error = None
+
         for target in targets:
-            perms = None
             if isinstance(target, (discord.TextChannel, discord.Thread)):
                 perms = target.permissions_for(guild.me)
-            if perms and not perms.read_message_history:
-                continue
+                if not perms.read_message_history:
+                    ch_error = "履歴の閲覧権限がありません"
+                    continue
 
             try:
                 count = 0
                 async for msg in target.history(limit=None, after=after):
                     if msg.author.bot:
                         continue
+                    ch_scanned += 1
+                    total_scanned += 1
+
                     text = clean_content(msg)
                     if is_noise(text):
                         continue
 
                     seq += 1
+                    ch_kept += 1
                     collected.append({
                         "id": seq,
                         "channel": ch_label,
@@ -177,10 +194,18 @@ async def collect_messages(
                     count += 1
                     if count % 300 == 0:
                         await asyncio.sleep(0.1)
-            except (discord.Forbidden, discord.HTTPException):
-                continue
+            except discord.Forbidden:
+                ch_error = "アクセスが拒否されました"
+            except discord.HTTPException as e:
+                ch_error = f"通信エラー ({e.status})"
 
-    return collected
+        if ch_error:
+            diagnostics.append(f"{ch_label}: {ch_error}")
+        else:
+            diagnostics.append(f"{ch_label}: {ch_scanned}件中 {ch_kept}件が候補")
+
+    diagnostics.append(f"合計 {total_scanned} 件をスキャン")
+    return collected, diagnostics
 
 
 # ==============================
@@ -204,7 +229,7 @@ def parse_json_array(raw: str) -> list[dict]:
 
 
 async def judge_batch(
-    client, batch: list[dict], sem: asyncio.Semaphore
+    client, batch: list[dict], sem: asyncio.Semaphore, errors: list[str]
 ) -> list[dict]:
     """1バッチ分を判定"""
     lines = []
@@ -230,23 +255,50 @@ async def judge_batch(
                 results = parse_json_array(raw)
                 if results:
                     return results
-except Exception as e:
-                print(f"⚠️ API判定エラー (attempt {attempt+1}): {type(e).__name__}: {e}")
+                msg = "APIは応答しましたがJSONを取得できませんでした"
+                print(f"⚠️ {msg} / 応答冒頭: {raw[:200]}")
+                if attempt == 2:
+                    errors.append(msg)
+            except Exception as e:
+                detail = f"{type(e).__name__}: {e}"
+                print(f"⚠️ API判定エラー (試行{attempt + 1}): {detail}")
+                traceback.print_exc()
+                if attempt == 2:
+                    errors.append(detail)
                 await asyncio.sleep(2 ** attempt)
     return []
 
 
-async def judge_all(messages: list[dict]) -> dict[int, dict]:
-    """全メッセージを判定し、id をキーにした辞書で返す"""
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-if AsyncAnthropic is None:
-        print("⚠️ anthropicライブラリが導入されていません。requirements.txtを確認してください。")
-        return {}
-    if not api_key:
-        print("⚠️ ANTHROPIC_API_KEYが取得できません。")
-        return {}
+async def judge_all(messages: list[dict]) -> tuple[dict[int, dict], list[str]]:
+    """
+    全メッセージを判定
+    戻り値: (id をキーにした判定結果, エラーメッセージのリスト)
+    """
+    errors: list[str] = []
 
-    client = AsyncAnthropic(api_key=api_key)
+    if AsyncAnthropic is None:
+        msg = (
+            "anthropicライブラリが読み込めません。"
+            "requirements.txt に anthropic を追加してください。"
+        )
+        if ANTHROPIC_IMPORT_ERROR:
+            msg += f"\n詳細: {ANTHROPIC_IMPORT_ERROR}"
+        print(f"⚠️ {msg}")
+        return {}, [msg]
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        msg = "ANTHROPIC_API_KEY を取得できませんでした。"
+        print(f"⚠️ {msg}")
+        return {}, [msg]
+
+    try:
+        client = AsyncAnthropic(api_key=api_key)
+    except Exception as e:
+        msg = f"APIクライアントの初期化に失敗しました: {type(e).__name__}: {e}"
+        print(f"⚠️ {msg}")
+        return {}, [msg]
+
     sem = asyncio.Semaphore(API_CONCURRENCY)
 
     batches = [
@@ -254,12 +306,15 @@ if AsyncAnthropic is None:
         for i in range(0, len(messages), BATCH_SIZE)
     ][:MAX_API_CALLS]
 
-    tasks = [judge_batch(client, b, sem) for b in batches]
+    tasks = [judge_batch(client, b, sem, errors) for b in batches]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     judged: dict[int, dict] = {}
     for res in results:
-        if isinstance(res, Exception) or not res:
+        if isinstance(res, Exception):
+            errors.append(f"{type(res).__name__}: {res}")
+            continue
+        if not res:
             continue
         for item in res:
             try:
@@ -270,7 +325,8 @@ if AsyncAnthropic is None:
                 }
             except (ValueError, TypeError, KeyError):
                 continue
-    return judged
+
+    return judged, errors
 
 
 # ==============================
@@ -315,27 +371,26 @@ class KouryakuMiningCog(commands.Cog):
         遡る日数: app_commands.Range[int, 1, 90] = DEFAULT_LOOKBACK_DAYS,
         最低スコア: app_commands.Range[int, 0, 5] = MIN_OUTPUT_SCORE,
     ):
+        # 3秒制限を回避するため、何よりも先にdeferする
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except discord.HTTPException:
+            return
+
         if interaction.guild is None:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "サーバー内で実行してください。", ephemeral=True
             )
             return
 
         if self._running:
-            await interaction.response.send_message(
-                "現在別の抽出処理が実行中です。完了までお待ちください。",
+            await interaction.followup.send(
+                "現在別の抽出処理が実行中です。完了までお待ちください。\n"
+                "状態が戻らない場合はBOTを再起動してください。",
                 ephemeral=True,
             )
             return
 
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            await interaction.response.send_message(
-                "環境変数 ANTHROPIC_API_KEY が設定されていません。",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
         self._running = True
 
         try:
@@ -345,36 +400,38 @@ class KouryakuMiningCog(commands.Cog):
                 f"過去 {遡る日数} 日分の発言を収集しています。", ephemeral=True
             )
 
-            messages = await collect_messages(guild, 遡る日数)
+            messages, diagnostics = await collect_messages(guild, 遡る日数)
+            diag_text = "\n".join(diagnostics)
 
             if not messages:
                 await interaction.followup.send(
-                    "対象となる発言が見つかりませんでした。\n"
-                    "Message Content Intent が有効か確認してください。",
+                    "対象となる発言が見つかりませんでした。\n\n"
+                    f"**スキャン結果**\n```\n{diag_text}\n```\n"
+                    "スキャン件数が0の場合、Message Content Intent が"
+                    "有効か確認してください。",
                     ephemeral=True,
                 )
                 return
 
-            capped = len(messages) > MAX_API_CALLS * BATCH_SIZE
             note = ""
-            if capped:
-                note = (
-                    f"\n※上限に達したため、新しい順 "
-                    f"{MAX_API_CALLS * BATCH_SIZE} 件のみ判定します。"
-                )
-                messages = messages[-(MAX_API_CALLS * BATCH_SIZE):]
+            if len(messages) > MAX_API_CALLS * BATCH_SIZE:
+                limit = MAX_API_CALLS * BATCH_SIZE
+                note = f"\n※上限に達したため、新しい順 {limit} 件のみ判定します。"
+                messages = messages[-limit:]
 
             await interaction.followup.send(
-                f"候補 {len(messages)} 件を判定しています。"
-                f"数分かかります。{note}",
+                f"候補 {len(messages)} 件を判定しています。数分かかります。{note}\n\n"
+                f"**収集結果**\n```\n{diag_text}\n```",
                 ephemeral=True,
             )
 
-            judged = await judge_all(messages)
+            judged, errors = await judge_all(messages)
 
             if not judged:
+                err_text = "\n".join(f"・{e}" for e in errors[:5]) or "・原因不明"
                 await interaction.followup.send(
-                    "判定に失敗しました。APIキーと残高を確認してください。",
+                    f"判定に失敗しました。\n\n**エラー内容**\n```\n{err_text}\n```\n"
+                    f"Railwayのログに詳細が出力されています。",
                     ephemeral=True,
                 )
                 return
@@ -400,9 +457,16 @@ class KouryakuMiningCog(commands.Cog):
                 })
 
             if not rows:
+                dist = {}
+                for j in judged.values():
+                    dist[j["score"]] = dist.get(j["score"], 0) + 1
+                dist_text = "\n".join(
+                    f"スコア{s}: {dist[s]} 件" for s in sorted(dist, reverse=True)
+                ) or "判定結果なし"
                 await interaction.followup.send(
-                    f"スコア {最低スコア} 以上の発言はありませんでした。\n"
-                    f"最低スコアを下げて再実行してみてください。",
+                    f"スコア {最低スコア} 以上の発言はありませんでした。\n\n"
+                    f"**判定の分布**\n```\n{dist_text}\n```\n"
+                    f"`最低スコア` を下げて再実行してみてください。",
                     ephemeral=True,
                 )
                 return
@@ -431,6 +495,13 @@ class KouryakuMiningCog(commands.Cog):
                 for c, n in sorted(by_channel.items(), key=lambda x: -x[1])
             )
 
+            warn = ""
+            if errors:
+                warn = (
+                    f"\n\n※一部のバッチで判定に失敗しました（{len(errors)}件）。"
+                    f"結果が少ない場合は再実行してください。"
+                )
+
             summary = (
                 f"**攻略情報 抽出結果**\n"
                 f"対象期間: 過去 {遡る日数} 日 / 判定 {len(messages)} 件\n\n"
@@ -438,7 +509,7 @@ class KouryakuMiningCog(commands.Cog):
                 f"**チャンネル別**\n{ch_lines}\n\n"
                 f"スコア5から順に確認することをおすすめします。\n"
                 f"記事化する際は、発言をそのまま引用せず"
-                f"内容を参考にして書き直してください。"
+                f"内容を参考にして書き直してください。{warn}"
             )
 
             try:
@@ -456,6 +527,16 @@ class KouryakuMiningCog(commands.Cog):
                     ephemeral=True,
                 )
 
+        except Exception as e:
+            print(f"⚠️ 攻略情報抽出で予期しないエラー: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            try:
+                await interaction.followup.send(
+                    f"処理中にエラーが発生しました。\n```\n{type(e).__name__}: {e}\n```",
+                    ephemeral=True,
+                )
+            except discord.HTTPException:
+                pass
         finally:
             self._running = False
 
@@ -480,5 +561,5 @@ async def setup(bot: commands.Bot):
 # 必要な環境変数:
 #   ANTHROPIC_API_KEY
 #
-# 必要なライブラリ:
+# 必要なライブラリ（requirements.txt）:
 #   anthropic
