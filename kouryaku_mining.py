@@ -23,9 +23,10 @@ from discord import app_commands
 from discord.ext import commands
 
 try:
-    from anthropic import AsyncAnthropic
+    from anthropic import Anthropic, AsyncAnthropic
     ANTHROPIC_IMPORT_ERROR = None
 except Exception as _e:  # ライブラリ未導入時に起動を止めない
+    Anthropic = None
     AsyncAnthropic = None
     ANTHROPIC_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
@@ -61,7 +62,12 @@ MAX_LENGTH = 1500         # 長すぎる投稿は切り詰め
 MODEL = "claude-haiku-4-5"
 BATCH_SIZE = 15           # 1回のAPI呼び出しで判定する件数
 MAX_API_CALLS = 200       # 暴走防止の上限
-API_CONCURRENCY = 3       # 同時実行数
+REQUEST_INTERVAL = 0.5    # リクエスト間の待機秒数
+
+# 非同期クライアントで接続エラーが続く場合、同期クライアントに自動で切り替える
+USE_SYNC_FALLBACK = False
+API_KEY_CACHE = ""
+API_CONCURRENCY = 1       # 同時実行数（Railway環境では並列にすると接続エラーになる）
 
 # 出力する最低スコア
 MIN_OUTPUT_SCORE = 3
@@ -240,18 +246,36 @@ async def judge_batch(
         )
     user_content = "以下の発言を判定してください。\n\n" + "\n".join(lines)
 
+    def _sync_call() -> str:
+        """非同期クライアントが使えない環境向けのフォールバック"""
+        sync_client = Anthropic(api_key=API_KEY_CACHE, max_retries=2, timeout=60.0)
+        r = sync_client.messages.create(
+            model=MODEL,
+            max_tokens=2000,
+            system=SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_content}],
+        )
+        return "".join(
+            b.text for b in r.content if getattr(b, "type", "") == "text"
+        )
+
     async with sem:
         for attempt in range(3):
             try:
-                resp = await client.messages.create(
-                    model=MODEL,
-                    max_tokens=2000,
-                    system=SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": user_content}],
-                )
-                raw = "".join(
-                    b.text for b in resp.content if getattr(b, "type", "") == "text"
-                )
+                if USE_SYNC_FALLBACK and Anthropic is not None:
+                    raw = await asyncio.to_thread(_sync_call)
+                else:
+                    resp = await client.messages.create(
+                        model=MODEL,
+                        max_tokens=2000,
+                        system=SYSTEM_PROMPT,
+                        messages=[{"role": "user", "content": user_content}],
+                        timeout=60.0,
+                    )
+                    raw = "".join(
+                        b.text for b in resp.content if getattr(b, "type", "") == "text"
+                    )
+                await asyncio.sleep(REQUEST_INTERVAL)
                 results = parse_json_array(raw)
                 if results:
                     return results
@@ -300,8 +324,11 @@ async def judge_all(messages: list[dict]) -> tuple[dict[int, dict], list[str]]:
         print(f"⚠️ {msg}")
         return {}, [msg]
 
+    global API_KEY_CACHE
+    API_KEY_CACHE = api_key
+
     try:
-        client = AsyncAnthropic(api_key=api_key)
+        client = AsyncAnthropic(api_key=api_key, max_retries=2, timeout=60.0)
     except Exception as e:
         msg = f"APIクライアントの初期化に失敗しました: {type(e).__name__}: {e}"
         print(f"⚠️ {msg}")
@@ -314,8 +341,25 @@ async def judge_all(messages: list[dict]) -> tuple[dict[int, dict], list[str]]:
         for i in range(0, len(messages), BATCH_SIZE)
     ][:MAX_API_CALLS]
 
-    tasks = [judge_batch(client, b, sem, errors) for b in batches]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    results: list = []
+
+    # 1バッチ目を単独で試し、失敗したら同期クライアントに切り替える
+    global USE_SYNC_FALLBACK
+    USE_SYNC_FALLBACK = False
+    first = await judge_batch(client, batches[0], sem, errors)
+
+    if not first and Anthropic is not None:
+        print("⚠️ 非同期クライアントで失敗したため、同期クライアントに切り替えます")
+        errors.clear()
+        USE_SYNC_FALLBACK = True
+        first = await judge_batch(client, batches[0], sem, errors)
+
+    results.append(first)
+
+    # 残りのバッチを順に処理
+    for b in batches[1:]:
+        res = await judge_batch(client, b, sem, errors)
+        results.append(res)
 
     judged: dict[int, dict] = {}
     for res in results:
@@ -600,19 +644,41 @@ class KouryakuMiningCog(commands.Cog):
                 b.text for b in resp.content if getattr(b, "type", "") == "text"
             )
             info.append("─" * 20)
-            info.append("結果             : 成功")
-            info.append(f"応答             : {text[:50]}")
+            info.append("非同期クライアント : 成功")
+            info.append(f"応答             : {text[:30]}")
         except Exception as e:
             info.append("─" * 20)
-            info.append("結果             : 失敗")
+            info.append("非同期クライアント : 失敗")
             info.append(f"エラー           : {type(e).__name__}: {e}")
             cause = e.__cause__ or e.__context__
             depth = 0
-            while cause is not None and depth < 4:
+            while cause is not None and depth < 3:
                 info.append(f"  原因{depth + 1} : {type(cause).__name__}: {cause}")
                 cause = cause.__cause__ or cause.__context__
                 depth += 1
-            print(f"⚠️ API接続テスト失敗: {type(e).__name__}: {e}")
+            print(f"⚠️ 非同期クライアント失敗: {type(e).__name__}: {e}")
+
+        # 同期クライアントでも試す
+        if Anthropic is not None:
+            def _sync_test() -> str:
+                c = Anthropic(api_key=key, max_retries=2, timeout=60.0)
+                r = c.messages.create(
+                    model=MODEL,
+                    max_tokens=20,
+                    messages=[{"role": "user", "content": "「接続確認」とだけ返してください"}],
+                )
+                return "".join(
+                    b.text for b in r.content if getattr(b, "type", "") == "text"
+                )
+
+            try:
+                text2 = await asyncio.to_thread(_sync_test)
+                info.append("同期クライアント : 成功")
+                info.append(f"応答             : {text2[:30]}")
+            except Exception as e:
+                info.append("同期クライアント : 失敗")
+                info.append(f"エラー           : {type(e).__name__}: {e}")
+                print(f"⚠️ 同期クライアント失敗: {type(e).__name__}: {e}")
 
         await interaction.followup.send(
             "```\n" + "\n".join(info) + "\n```", ephemeral=True
