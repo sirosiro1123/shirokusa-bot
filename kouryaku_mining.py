@@ -239,7 +239,11 @@ except Exception as e:
 async def judge_all(messages: list[dict]) -> dict[int, dict]:
     """全メッセージを判定し、id をキーにした辞書で返す"""
     api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key or AsyncAnthropic is None:
+if AsyncAnthropic is None:
+        print("⚠️ anthropicライブラリが導入されていません。requirements.txtを確認してください。")
+        return {}
+    if not api_key:
+        print("⚠️ ANTHROPIC_API_KEYが取得できません。")
         return {}
 
     client = AsyncAnthropic(api_key=api_key)
