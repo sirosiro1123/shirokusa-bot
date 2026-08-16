@@ -256,13 +256,21 @@ async def judge_batch(
                 if results:
                     return results
                 msg = "APIは応答しましたがJSONを取得できませんでした"
-                print(f"⚠️ {msg} / 応答冒頭: {raw[:200]}")
+                if attempt == 0:
+                    print(f"⚠️ {msg} / 応答冒頭: {raw[:200]}")
                 if attempt == 2:
                     errors.append(msg)
             except Exception as e:
                 detail = f"{type(e).__name__}: {e}"
-                print(f"⚠️ API判定エラー (試行{attempt + 1}): {detail}")
-                traceback.print_exc()
+                if attempt == 0:
+                    # ログのレート制限を避けるため初回のみ出力する
+                    print(f"⚠️ API判定エラー: {detail}")
+                    cause = e.__cause__ or e.__context__
+                    depth = 0
+                    while cause is not None and depth < 3:
+                        print(f"   原因{depth + 1}: {type(cause).__name__}: {cause}")
+                        cause = cause.__cause__ or cause.__context__
+                        depth += 1
                 if attempt == 2:
                     errors.append(detail)
                 await asyncio.sleep(2 ** attempt)
@@ -286,7 +294,7 @@ async def judge_all(messages: list[dict]) -> tuple[dict[int, dict], list[str]]:
         print(f"⚠️ {msg}")
         return {}, [msg]
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
     if not api_key:
         msg = "ANTHROPIC_API_KEY を取得できませんでした。"
         print(f"⚠️ {msg}")
@@ -539,6 +547,76 @@ class KouryakuMiningCog(commands.Cog):
                 pass
         finally:
             self._running = False
+
+    @app_commands.command(
+        name="api接続テスト",
+        description="Anthropic APIへの接続を確認します（管理者専用）",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def api_test(self, interaction: discord.Interaction):
+        """APIキーと接続経路を診断する"""
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except discord.HTTPException:
+            return
+
+        raw = os.environ.get("ANTHROPIC_API_KEY")
+        if raw is None:
+            await interaction.followup.send(
+                "環境変数 ANTHROPIC_API_KEY が取得できません。\n"
+                "Railway の Variables を確認してください。",
+                ephemeral=True,
+            )
+            return
+
+        key = raw.strip()
+        info = [
+            f"取得できた文字数 : {len(raw)}",
+            f"整形後の文字数   : {len(key)}",
+            f"前後の空白・改行 : {'あり（要修正）' if len(raw) != len(key) else 'なし'}",
+            f"接頭辞           : {key[:7]}...",
+            f"末尾4文字        : ...{key[-4:]}",
+            f"想定形式         : {'OK' if key.startswith('sk-ant-') else '不正（sk-ant- で始まっていません）'}",
+            f"ライブラリ       : {'読込済' if AsyncAnthropic else '未読込'}",
+            f"使用モデル       : {MODEL}",
+        ]
+
+        if AsyncAnthropic is None:
+            if ANTHROPIC_IMPORT_ERROR:
+                info.append(f"読込エラー       : {ANTHROPIC_IMPORT_ERROR}")
+            await interaction.followup.send(
+                "```\n" + "\n".join(info) + "\n```", ephemeral=True
+            )
+            return
+
+        try:
+            client = AsyncAnthropic(api_key=key)
+            resp = await client.messages.create(
+                model=MODEL,
+                max_tokens=20,
+                messages=[{"role": "user", "content": "「接続確認」とだけ返してください"}],
+            )
+            text = "".join(
+                b.text for b in resp.content if getattr(b, "type", "") == "text"
+            )
+            info.append("─" * 20)
+            info.append("結果             : 成功")
+            info.append(f"応答             : {text[:50]}")
+        except Exception as e:
+            info.append("─" * 20)
+            info.append("結果             : 失敗")
+            info.append(f"エラー           : {type(e).__name__}: {e}")
+            cause = e.__cause__ or e.__context__
+            depth = 0
+            while cause is not None and depth < 4:
+                info.append(f"  原因{depth + 1} : {type(cause).__name__}: {cause}")
+                cause = cause.__cause__ or cause.__context__
+                depth += 1
+            print(f"⚠️ API接続テスト失敗: {type(e).__name__}: {e}")
+
+        await interaction.followup.send(
+            "```\n" + "\n".join(info) + "\n```", ephemeral=True
+        )
 
 
 async def setup(bot: commands.Bot):
