@@ -14,50 +14,73 @@ from vc_notice import (
     _effective_mode,
 )
 
+# 管理者用コマンド（追加）
+from joho_list import JohoListCog
+from kouryaku_mining import KouryakuMiningCog
+
+# ==============================
+# サーバーID
+# ==============================
+GUILD_ID = 1194515135071539210
+
 # ==============================
 # チャンネルID設定
 # ==============================
-VC_MAIN        = "https://discord.com/channels/1194515135071539210/1208804697801236564"
-VC_SUB         = "https://discord.com/channels/1194515135071539210/1407176497084629122"
-VC_ANNOUNCE    = "https://discord.com/channels/1194515135071539210/1467189822350295213"
-VC_EVENT       = "https://discord.com/channels/1194515135071539210/1510620128146882610"
+BASE = "https://discord.com/channels/1194515135071539210"
 
-CHAT_GENERAL   = "https://discord.com/channels/1194515135071539210/1200096269293596693"
-CHAT_RHYTHM    = "https://discord.com/channels/1194515135071539210/1409705776028848158"
-CHAT_MESHI     = "https://discord.com/channels/1194515135071539210/1529673772997808211"
-CHAT_BASEBALL  = "https://discord.com/channels/1194515135071539210/1502993527108534272"
+# VC関連
+VC_MAIN = f"{BASE}/1208804697801236564"
+VC_SUB = f"{BASE}/1407176497084629122"
+VC_EVENT = f"{BASE}/1510620128146882610"
+VC_ANNOUNCE = f"{BASE}/1467189822350295213"
 
-CLASS_ELF      = "https://discord.com/channels/1194515135071539210/1384171023766781982"
-CLASS_ROYAL    = "https://discord.com/channels/1194515135071539210/1384171025151037631"
-CLASS_WITCH    = "https://discord.com/channels/1194515135071539210/1384171181090930811"
-CLASS_DRAGON   = "https://discord.com/channels/1194515135071539210/1384171197004255325"
-CLASS_NIGHT    = "https://discord.com/channels/1194515135071539210/1384171212716113930"
-CLASS_BISHOP   = "https://discord.com/channels/1194515135071539210/1384171225345036338"
-CLASS_NEMESIS  = "https://discord.com/channels/1194515135071539210/1384171237919428659"
-CLASS_2PICK    = "https://discord.com/channels/1194515135071539210/1521414016491065454"
-TODAY_JUDGE    = "https://discord.com/channels/1194515135071539210/1458372480795414569"
-CONSULT        = "https://discord.com/channels/1194515135071539210/1401026533434458264"
+# 雑談関連
+CHAT_GENERAL = f"{BASE}/1200096269293596693"
+CHAT_RHYTHM = f"{BASE}/1421749620010123355"
+CHAT_MESHI = f"{BASE}/1529673772997808211"
+CHAT_BASEBALL = f"{BASE}/1502993527108534272"
 
-ANNOUNCE_OPS   = "https://discord.com/channels/1194515135071539210/1195015362526326904"
-ANNOUNCE_TOUR  = "https://discord.com/channels/1194515135071539210/1401015993395970259"
-ANNOUNCE_EVENT = "https://discord.com/channels/1194515135071539210/1503580110282821802"
-RULES          = "https://discord.com/channels/1194515135071539210/1401016513061720084"
-ROLE_LIST      = "https://discord.com/channels/1194515135071539210/1401220412368617647"
-ROLE_PROOF     = "https://discord.com/channels/1194515135071539210/1402984558819020800"
-IDEA_BOX       = "https://discord.com/channels/1194515135071539210/1401393478348443788"
-DISBOARD       = "https://discord.com/channels/1194515135071539210/1401437902394753125"
-TOURNAMENT     = "https://discord.com/channels/1194515135071539210/1513219971281584169"
+# 攻略・クラス相談
+CONSULT = f"{BASE}/1401026533434458264"
+TODAY_JUDGE = f"{BASE}/1458372480795414569"
+CLASS_ELF = f"{BASE}/1384171023766781982"
+CLASS_ROYAL = f"{BASE}/1384171025151037631"
+CLASS_WITCH = f"{BASE}/1384171181090930811"
+CLASS_DRAGON = f"{BASE}/1384171197004255325"
+CLASS_NIGHT = f"{BASE}/1384171212716113930"
+CLASS_BISHOP = f"{BASE}/1384171225345036338"
+CLASS_NEMESIS = f"{BASE}/1384171237919428659"
+CLASS_2PICK = f"{BASE}/1521414016491065454"
+
+# お知らせ・ルール
+RULES = f"{BASE}/1401016513061720084"
+ANNOUNCE_OPS = f"{BASE}/1195015362526326904"
+ROLE_LIST = f"{BASE}/1401220412368617647"
+ROLE_PROOF = f"{BASE}/1402984558819020800"
+IDEA_BOX = f"{BASE}/1401393478348443788"
+
+# 大会・イベント
+ANNOUNCE_TOUR = f"{BASE}/1401015993395970259"
+ANNOUNCE_EVENT = f"{BASE}/1503580110282821802"
+TOURNAMENT = f"{BASE}/1513219971281584169"
+
+# その他
+DISBOARD = f"{BASE}/1401437902394753125"
+BENRI = f"{BASE}/1534017790363697383"          # 便利機能（追加）
+DECK_BOSHU = f"{BASE}/1510289539745316874"     # デッキ募集（追加）
 
 # ==============================
 # BOT設定
 # ==============================
 intents = discord.Intents.default()
 intents.message_content = True
-intents.voice_states = True          # ← VC入退室の検知に必要（追加）
+intents.voice_states = True          # VC入退室の検知に必要
+intents.members = True               # ロール保持者の取得に必要（追加）
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# VC入室時の注意事項機能を登録（追加）
+# VC入室時の注意事項機能を登録
 setup_vc_notice(bot)
+
 
 # ==============================
 # メインメニューView
@@ -90,6 +113,7 @@ class MainMenuView(discord.ui.View):
     async def command_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(embed=command_embed(), view=BackView(), ephemeral=True)
 
+
 # ==============================
 # 戻るボタンView
 # ==============================
@@ -100,6 +124,7 @@ class BackView(discord.ui.View):
     @discord.ui.button(label="◀️ メニューに戻る", style=discord.ButtonStyle.danger, custom_id="guide_back")
     async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(embed=main_embed(), view=MainMenuView())
+
 
 # ==============================
 # Embed定義
@@ -112,6 +137,7 @@ def main_embed():
     )
     e.set_footer(text="しろくさDiscord | ガイドBOT")
     return e
+
 
 def vc_embed():
     e = discord.Embed(title="🎙️ VC・通話チャンネルの使い方", color=0x27AE60)
@@ -133,6 +159,7 @@ def vc_embed():
     e.set_footer(text="◀️ 戻るボタンでメニューに戻れます")
     return e
 
+
 def chat_embed():
     e = discord.Embed(title="💬 雑談チャンネルの使い方", color=0xF39C12)
     e.add_field(name="🎮 シャドバ雑談",
@@ -142,13 +169,14 @@ def chat_embed():
         value=f"[リズムゲーム雑談]({CHAT_RHYTHM})\nリズムゲーム関連の話題はこちら",
         inline=False)
     e.add_field(name="🍜 飯テロ",
-        value=f"[飯テロチャンネル]({CHAT_MESHI})\n食べ物画像を投稿すると\nしろ子から厳しめの診断が届きます😂\n※あくまで面白診断です！",
+        value=f"[飯テロチャンネル]({CHAT_MESHI})\n食べ物画像を投稿すると\nしろ子から厳しめの診断が届きます😂\n\n累計の査定に応じて称号が自動で付きます。\n`/飯テロ称号一覧` `/飯テロカルテ` で確認できます\n※あくまで面白診断です！",
         inline=False)
     e.add_field(name="⚾ スポーツ雑談",
         value=f"[野球・スポーツ雑談]({CHAT_BASEBALL})\nスポーツ全般の話題はこちら",
         inline=False)
     e.set_footer(text="◀️ 戻るボタンでメニューに戻れます")
     return e
+
 
 def class_embed():
     e = discord.Embed(title="⚔️ 攻略・クラス相談チャンネル", color=0xE74C3C)
@@ -157,6 +185,9 @@ def class_embed():
         inline=False)
     e.add_field(name="📅 あのターン、どうすれば？",
         value=f"[今日の一判断]({TODAY_JUDGE})\n「このターンどう動けばよかった？」\nを話し合うチャンネル",
+        inline=False)
+    e.add_field(name="🔧 デッキを見てほしいとき",
+        value=f"[デッキ募集]({DECK_BOSHU})\n使っている構築を投稿して意見をもらえます\nネタデッキも歓迎！\n\n意見が不要な場合は【共有のみ】タグを付けてね",
         inline=False)
     e.add_field(name="🃏 クラス別相談チャンネル",
         value=(
@@ -167,6 +198,7 @@ def class_embed():
         inline=False)
     e.set_footer(text="◀️ 戻るボタンでメニューに戻れます")
     return e
+
 
 def announce_embed():
     e = discord.Embed(title="📢 お知らせ・ルール関連", color=0x8E44AD)
@@ -185,6 +217,7 @@ def announce_embed():
     e.set_footer(text="◀️ 戻るボタンでメニューに戻れます")
     return e
 
+
 def tournament_embed():
     e = discord.Embed(title="🏆 大会・イベント関連", color=0xF0B429)
     e.add_field(name="📣 大会アナウンス",
@@ -202,16 +235,27 @@ def tournament_embed():
     e.set_footer(text="◀️ 戻るボタンでメニューに戻れます")
     return e
 
+
 def command_embed():
     e = discord.Embed(title="⚙️ コマンド・その他", color=0x7F8C8D)
+    e.add_field(name="🟩 便利機能まとめ",
+        value=f"[便利機能チャンネル]({BENRI})\nサーバーで使えるコマンドや\n通知機能をまとめています",
+        inline=False)
     e.add_field(name="📈 ディスボード上げ",
         value=f"[ディスボード上げチャンネル]({DISBOARD})\n`/bump` と入力するとサーバーの\n優先順位を上げられます！\n※2時間に1回更新可能",
+        inline=False)
+    e.add_field(name="🍜 飯テロの称号確認",
+        value="`/飯テロ称号一覧` … 全称号と次の称号まであと何年か\n`/飯テロカルテ` … 自分の累計と現在の称号",
+        inline=False)
+    e.add_field(name="🚨 ルール違反の報告",
+        value="`/通報` … 運営に報告できます\n内容は他の人には見えません",
         inline=False)
     e.add_field(name="📘 このガイドを表示する",
         value="`/ガイド` と入力するといつでもこのメニューが表示されます",
         inline=False)
     e.set_footer(text="◀️ 戻るボタンでメニューに戻れます")
     return e
+
 
 # ==============================
 # スラッシュコマンド
@@ -263,16 +307,39 @@ async def report(interaction: discord.Interaction):
             ephemeral=True,
         )
 
+
 # ==============================
 # 起動処理
 # ==============================
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
-    print(f"✅ BOT起動完了: {bot.user}")
+    guild_obj = discord.Object(id=GUILD_ID)
+
+    # 管理者用Cogを登録（重複登録を防ぐ）
+    try:
+        if bot.get_cog("JohoListCog") is None:
+            await bot.add_cog(JohoListCog(bot), guild=guild_obj)
+        if bot.get_cog("KouryakuMiningCog") is None:
+            await bot.add_cog(KouryakuMiningCog(bot), guild=guild_obj)
+    except Exception as e:
+        print(f"⚠️ Cog登録に失敗しました: {e}")
+
+    # グローバルコマンドをギルドへコピーして即時同期
+    try:
+        bot.tree.copy_global_to(guild=guild_obj)
+        synced = await bot.tree.sync(guild=guild_obj)
+        print(f"✅ コマンド同期完了: {len(synced)} 件")
+        for cmd in synced:
+            print(f"   - /{cmd.name}")
+    except Exception as e:
+        print(f"⚠️ コマンド同期に失敗しました: {e}")
+
     bot.add_view(MainMenuView())
     bot.add_view(BackView())
     bot.add_view(ReportView())
+
+    print(f"✅ BOT起動完了: {bot.user}")
+
 
 # ==============================
 # トークン（環境変数から読み込む）
