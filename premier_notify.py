@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 import asyncio
 
 class PremierSeriesNotifier(commands.Cog):
-    """Shadowverse Premier Series の試合日程を自動通知（大会前日・当日のみ）"""
+    """Shadowverse Premier Series の試合日程を自動通知（公式ページリンク付き）"""
     
     def __init__(self, bot):
         self.bot = bot
@@ -90,7 +90,7 @@ class PremierSeriesNotifier(commands.Cog):
             # Embed を作成
             embed = discord.Embed(
                 title=f"📺 プレミアシリーズ {title} 【{match_type}】",
-                description=f"⏰ **{time_str}** に開始予定\n🔗 [公式ページ]({self.official_url})",
+                description=f"⏰ **{time_str}** に開始予定\n🔗 [公式ページで配信を確認]({self.official_url})",
                 color=0x1e90ff  # Dodger Blue
             )
             
@@ -100,13 +100,8 @@ class PremierSeriesNotifier(commands.Cog):
                 match = round_data[f'match_{match_count}']
                 team_a = match['team_a']
                 team_b = match['team_b']
-                broadcast = match.get('broadcast', 'TBD')
                 
                 match_info = f"**{team_a}** vs **{team_b}**"
-                if broadcast != 'TBD':
-                    match_info += f"\n🔗 [配信を見る]({broadcast})"
-                else:
-                    match_info += f"\n📡 配信URL未定"
                 
                 embed.add_field(
                     name=f"ROUND {match_count}",
@@ -157,7 +152,7 @@ class PremierSeriesNotifier(commands.Cog):
         # Embed を作成
         embed = discord.Embed(
             title=f"📺 プレミアシリーズ {title}",
-            description=f"📅 **{date_str}** ⏰ **{time_str}**\n🔗 [公式ページ]({self.official_url})",
+            description=f"📅 **{date_str}** ⏰ **{time_str}**\n🔗 [公式ページで配信を確認]({self.official_url})",
             color=0x1e90ff
         )
         
@@ -167,13 +162,8 @@ class PremierSeriesNotifier(commands.Cog):
             match = next_match[f'match_{match_count}']
             team_a = match['team_a']
             team_b = match['team_b']
-            broadcast = match.get('broadcast', 'TBD')
             
             match_info = f"**{team_a}** vs **{team_b}**"
-            if broadcast != 'TBD':
-                match_info += f"\n🔗 [配信を見る]({broadcast})"
-            else:
-                match_info += f"\n📡 配信URL未定"
             
             embed.add_field(
                 name=f"ROUND {match_count}",
