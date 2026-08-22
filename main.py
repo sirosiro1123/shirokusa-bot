@@ -17,6 +17,7 @@ from vc_notice import (
 # 管理者用コマンド（追加）
 from joho_list import JohoListCog
 from kouryaku_mining import KouryakuMiningCog
+from premier_notify import PremierSeriesNotifier
 
 # ==============================
 # サーバーID
@@ -321,6 +322,8 @@ async def on_ready():
             await bot.add_cog(JohoListCog(bot), guild=guild_obj)
         if bot.get_cog("KouryakuMiningCog") is None:
             await bot.add_cog(KouryakuMiningCog(bot), guild=guild_obj)
+        if bot.get_cog("PremierSeriesNotifier") is None:
+            await bot.add_cog(PremierSeriesNotifier(bot), guild=guild_obj)
     except Exception as e:
         print(f"⚠️ Cog登録に失敗しました: {e}")
 
