@@ -1,0 +1,60 @@
+{
+  "matches": [
+    {
+      "round": 5,
+      "title": "第5節・後半",
+      "date": "2026-08-26",
+      "time": "12:30",
+      "match_1": {
+        "team_a": "Crazy Raccoon",
+        "team_b": "レバンガ北海道"
+      },
+      "match_2": {
+        "team_a": "ZETA DIVISION",
+        "team_b": "MURASH GAMING"
+      }
+    },
+    {
+      "round": 6,
+      "title": "第6節・前半",
+      "date": "2026-09-02",
+      "time": "12:30",
+      "match_1": {
+        "team_a": "父ノ背中",
+        "team_b": "Absolut Gaming"
+      },
+      "match_2": {
+        "team_a": "CYCLONE",
+        "team_b": "チームアニマル"
+      }
+    },
+    {
+      "round": 6,
+      "title": "第6節・後半",
+      "date": "2026-09-09",
+      "time": "12:30",
+      "match_1": {
+        "team_a": "豆柴GAMING",
+        "team_b": "バンダイナムコ eSports"
+      },
+      "match_2": {
+        "team_a": "RASCAL JESTER",
+        "team_b": "梅ヶ谷部族"
+      }
+    },
+    {
+      "round": 7,
+      "title": "第7節・前半",
+      "date": "2026-09-16",
+      "time": "12:30",
+      "match_1": {
+        "team_a": "渋谷ハル所属チーム",
+        "team_b": "Fnatic"
+      },
+      "match_2": {
+        "team_a": "Global Forces",
+        "team_b": "NORTH ESPORTS"
+      }
+    }
+  ]
+}
