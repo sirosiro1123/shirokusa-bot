@@ -63,7 +63,11 @@ class PremierSeriesNotifier(commands.Cog):
             with open(SCHEDULE_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             matches = data.get("matches", [])
-            print(f"✅ スケジュール読み込み: {len(matches)} 件")
+            last = matches[-1].get("title", "?") if matches else "なし"
+            print(
+                f"✅ スケジュール読み込み: {len(matches)} 件 "
+                f"（最後の節: {last} / path={os.path.abspath(SCHEDULE_FILE)}）"
+            )
             return matches
         except json.JSONDecodeError as e:
             print(f"❌ JSONの形式が不正です: {e}")
@@ -210,6 +214,28 @@ class PremierSeriesNotifier(commands.Cog):
         if not isinstance(event_vc, discord.VoiceChannel):
             return 0, 0, [f"ID {EVENT_VC_ID} はボイスチャンネルではありません"]
 
+        # ---- 診断ログ：BOTが実際に持っている権限を出力 ----
+        me = guild.me
+        if me is not None:
+            gp = me.guild_permissions
+            cp = event_vc.permissions_for(me)
+            print(
+                "🔎 権限診断 | サーバー全体: "
+                f"create_events={getattr(gp, 'create_events', 'N/A')} "
+                f"manage_events={gp.manage_events} "
+                f"administrator={gp.administrator} / "
+                f"イベントVC({event_vc.name}): view={cp.view_channel} connect={cp.connect}"
+            )
+            missing = []
+            if not (getattr(gp, "create_events", False) or gp.manage_events or gp.administrator):
+                missing.append("イベントを作成")
+            if not cp.view_channel:
+                missing.append("イベントVCのチャンネルを見る")
+            if not cp.connect:
+                missing.append("イベントVCの接続")
+            if missing:
+                print(f"⚠️ 不足している権限: {', '.join(missing)}")
+
         # 既存のスケジュールイベントを取得（再起動しても正しく判定できる）
         try:
             existing = await guild.fetch_scheduled_events()
@@ -251,8 +277,22 @@ class PremierSeriesNotifier(commands.Cog):
                 created += 1
                 existing_keys.add(key)
                 await asyncio.sleep(1)  # レート制限対策
-            except discord.Forbidden:
-                errors.append("イベント作成の権限がありません（BOTに「イベントの管理」権限が必要）")
+            except discord.Forbidden as e:
+                code = getattr(e, "code", None)
+                text = getattr(e, "text", "") or str(e)
+                print(f"❌ Forbidden詳細: status={e.status} code={code} text={text}")
+
+                if code == 60003:
+                    hint = (
+                        "サーバーで2要素認証（2FA）の必須化が有効になっています。"
+                        "BOT所有アカウントで2FAを有効にしてください"
+                    )
+                elif code == 50013:
+                    hint = "権限不足です。上のログ「権限診断」で不足項目を確認してください"
+                else:
+                    hint = "詳細はRailwayのログを確認してください"
+
+                errors.append(f"403 (code={code}): {text}\n→ {hint}")
                 break
             except Exception as e:
                 errors.append(f"{name}: {type(e).__name__}: {e}")
