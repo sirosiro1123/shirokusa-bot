@@ -4,56 +4,266 @@
       "round": 5,
       "title": "第5節・後半",
       "date": "2026-08-26",
-      "time": "12:30",
+      "time": "TBD",
       "match_1": {
-        "team_a": "Crazy Raccoon",
-        "team_b": "レバンガ北海道"
+        "team_a": "レバンガ北海道",
+        "team_b": "DetonatioN FocusMe"
       },
       "match_2": {
-        "team_a": "ZETA DIVISION",
-        "team_b": "MURASH GAMING"
+        "team_a": "VARREL",
+        "team_b": "ZETA DIVISION"
       }
     },
     {
       "round": 6,
       "title": "第6節・前半",
-      "date": "2026-09-02",
-      "time": "12:30",
+      "date": "2026-08-30",
+      "time": "TBD",
       "match_1": {
-        "team_a": "父ノ背中",
-        "team_b": "Absolut Gaming"
+        "team_a": "Crazy Raccoon",
+        "team_b": "RIDDLE ORDER"
       },
       "match_2": {
-        "team_a": "CYCLONE",
-        "team_b": "チームアニマル"
+        "team_a": "MURASH GAMING",
+        "team_b": "DetonatioN FocusMe"
       }
     },
     {
       "round": 6,
       "title": "第6節・後半",
-      "date": "2026-09-09",
-      "time": "12:30",
+      "date": "2026-08-30",
+      "time": "TBD",
       "match_1": {
-        "team_a": "豆柴GAMING",
-        "team_b": "バンダイナムコ eSports"
+        "team_a": "REJECT",
+        "team_b": "ZETA DIVISION"
       },
       "match_2": {
-        "team_a": "RASCAL JESTER",
-        "team_b": "梅ヶ谷部族"
+        "team_a": "レバンガ北海道",
+        "team_b": "VARREL"
       }
     },
     {
       "round": 7,
       "title": "第7節・前半",
-      "date": "2026-09-16",
-      "time": "12:30",
+      "date": "2026-09-02",
+      "time": "TBD",
       "match_1": {
-        "team_a": "渋谷ハル所属チーム",
-        "team_b": "Fnatic"
+        "team_a": "Crazy Raccoon",
+        "team_b": "DetonatioN FocusMe"
       },
       "match_2": {
-        "team_a": "Global Forces",
-        "team_b": "NORTH ESPORTS"
+        "team_a": "RIDDLE ORDER",
+        "team_b": "ZETA DIVISION"
+      }
+    },
+    {
+      "round": 7,
+      "title": "第7節・後半",
+      "date": "2026-09-09",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "MURASH GAMING",
+        "team_b": "VARREL"
+      },
+      "match_2": {
+        "team_a": "REJECT",
+        "team_b": "レバンガ北海道"
+      }
+    },
+    {
+      "round": 8,
+      "title": "第8節・前半",
+      "date": "2026-09-23",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "REJECT",
+        "team_b": "MURASH GAMING"
+      },
+      "match_2": {
+        "team_a": "レバンガ北海道",
+        "team_b": "RIDDLE ORDER"
+      }
+    },
+    {
+      "round": 8,
+      "title": "第8節・後半",
+      "date": "2026-10-07",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "VARREL",
+        "team_b": "DetonatioN FocusMe"
+      },
+      "match_2": {
+        "team_a": "ZETA DIVISION",
+        "team_b": "Crazy Raccoon"
+      }
+    },
+    {
+      "round": 9,
+      "title": "第9節・前半",
+      "date": "2026-10-14",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "MURASH GAMING",
+        "team_b": "RIDDLE ORDER"
+      },
+      "match_2": {
+        "team_a": "REJECT",
+        "team_b": "DetonatioN FocusMe"
+      }
+    },
+    {
+      "round": 9,
+      "title": "第9節・後半",
+      "date": "2026-10-21",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "レバンガ北海道",
+        "team_b": "ZETA DIVISION"
+      },
+      "match_2": {
+        "team_a": "VARREL",
+        "team_b": "Crazy Raccoon"
+      }
+    },
+    {
+      "round": 10,
+      "title": "第10節・前半",
+      "date": "2026-11-01",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "RIDDLE ORDER",
+        "team_b": "DetonatioN FocusMe"
+      },
+      "match_2": {
+        "team_a": "MURASH GAMING",
+        "team_b": "ZETA DIVISION"
+      }
+    },
+    {
+      "round": 10,
+      "title": "第10節・後半",
+      "date": "2026-11-01",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "REJECT",
+        "team_b": "VARREL"
+      },
+      "match_2": {
+        "team_a": "レバンガ北海道",
+        "team_b": "Crazy Raccoon"
+      }
+    },
+    {
+      "round": 11,
+      "title": "第11節・前半",
+      "date": "2026-11-11",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "DetonatioN FocusMe",
+        "team_b": "ZETA DIVISION"
+      },
+      "match_2": {
+        "team_a": "RIDDLE ORDER",
+        "team_b": "VARREL"
+      }
+    },
+    {
+      "round": 11,
+      "title": "第11節・後半",
+      "date": "2026-11-18",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "MURASH GAMING",
+        "team_b": "レバンガ北海道"
+      },
+      "match_2": {
+        "team_a": "REJECT",
+        "team_b": "Crazy Raccoon"
+      }
+    },
+    {
+      "round": 12,
+      "title": "第12節・前半",
+      "date": "2026-12-27",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "ZETA DIVISION",
+        "team_b": "VARREL"
+      },
+      "match_2": {
+        "team_a": "DetonatioN FocusMe",
+        "team_b": "レバンガ北海道"
+      }
+    },
+    {
+      "round": 12,
+      "title": "第12節・後半",
+      "date": "2026-12-27",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "RIDDLE ORDER",
+        "team_b": "REJECT"
+      },
+      "match_2": {
+        "team_a": "MURASH GAMING",
+        "team_b": "Crazy Raccoon"
+      }
+    },
+    {
+      "round": 13,
+      "title": "第13節・前半",
+      "date": "2027-01-06",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "VARREL",
+        "team_b": "レバンガ北海道"
+      },
+      "match_2": {
+        "team_a": "ZETA DIVISION",
+        "team_b": "REJECT"
+      }
+    },
+    {
+      "round": 13,
+      "title": "第13節・後半",
+      "date": "2027-01-13",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "DetonatioN FocusMe",
+        "team_b": "MURASH GAMING"
+      },
+      "match_2": {
+        "team_a": "RIDDLE ORDER",
+        "team_b": "Crazy Raccoon"
+      }
+    },
+    {
+      "round": 14,
+      "title": "第14節・前半",
+      "date": "2027-01-24",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "レバンガ北海道",
+        "team_b": "REJECT"
+      },
+      "match_2": {
+        "team_a": "VARREL",
+        "team_b": "MURASH GAMING"
+      }
+    },
+    {
+      "round": 14,
+      "title": "第14節・後半",
+      "date": "2027-01-24",
+      "time": "TBD",
+      "match_1": {
+        "team_a": "ZETA DIVISION",
+        "team_b": "RIDDLE ORDER"
+      },
+      "match_2": {
+        "team_a": "DetonatioN FocusMe",
+        "team_b": "Crazy Raccoon"
       }
     }
   ]

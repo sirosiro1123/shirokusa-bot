@@ -26,6 +26,9 @@ ROLE_ID = 1540617363777388585          # @プレミアシリーズ観戦者
 SCHEDULE_FILE = "data/premier_schedule.json"
 OFFICIAL_URL = "https://ps.shadowverse-wb.com/26-27/schedule-results/"
 
+# 同時視聴に使うイベントVC（Discordイベントの開催場所）
+EVENT_VC_ID = 1510620128146882610      # 🎤イベントVC
+
 JST = timezone(timedelta(hours=9))
 
 # 一括作成の対象期間（日数）
@@ -177,7 +180,8 @@ class PremierSeriesNotifier(commands.Cog):
     def build_description(self, round_data: dict) -> str:
         lines = [f"ROUND {i}: {a} vs {b}" for i, a, b in self.iter_cards(round_data)]
         lines.append("")
-        lines.append(f"公式ページ: {OFFICIAL_URL}")
+        lines.append("🎧 イベントVCに集まって同時視聴します。出入り自由です。")
+        lines.append(f"配信は公式ページから: {OFFICIAL_URL}")
         return "\n".join(lines)
 
     # ==============================
@@ -195,6 +199,16 @@ class PremierSeriesNotifier(commands.Cog):
         targets = self.upcoming_in_window()
         if not targets:
             return 0, 0, []
+
+        # 同時視聴用のイベントVCを取得（イベントの開催場所になる）
+        event_vc = guild.get_channel(EVENT_VC_ID)
+        if event_vc is None:
+            return 0, 0, [
+                f"イベントVC（ID: {EVENT_VC_ID}）が見つかりません。"
+                "IDが正しいか、BOTにそのチャンネルの閲覧権限があるか確認してください"
+            ]
+        if not isinstance(event_vc, discord.VoiceChannel):
+            return 0, 0, [f"ID {EVENT_VC_ID} はボイスチャンネルではありません"]
 
         # 既存のスケジュールイベントを取得（再起動しても正しく判定できる）
         try:
@@ -230,8 +244,8 @@ class PremierSeriesNotifier(commands.Cog):
                     description=self.build_description(round_data),
                     start_time=start_time,
                     end_time=start_time + timedelta(hours=EVENT_DURATION_HOURS),
-                    entity_type=discord.EntityType.external,
-                    location=OFFICIAL_URL,
+                    entity_type=discord.EntityType.voice,
+                    channel=event_vc,
                     privacy_level=discord.PrivacyLevel.guild_only,
                 )
                 created += 1
