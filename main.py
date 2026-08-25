@@ -17,6 +17,7 @@ from vc_notice import (
 # 管理者用コマンド（追加）
 from joho_list import JohoListCog
 from kouryaku_mining import KouryakuMiningCog
+from koken_rank import KokenRankCog
 from premier_notify import PremierSeriesNotifier
 
 # ==============================
@@ -322,6 +323,8 @@ async def on_ready():
             await bot.add_cog(JohoListCog(bot), guild=guild_obj)
         if bot.get_cog("KouryakuMiningCog") is None:
             await bot.add_cog(KouryakuMiningCog(bot), guild=guild_obj)
+        if bot.get_cog("KokenRankCog") is None:
+            await bot.add_cog(KokenRankCog(bot), guild=guild_obj)
         if bot.get_cog("PremierSeriesNotifier") is None:
             await bot.add_cog(PremierSeriesNotifier(bot), guild=guild_obj)
     except Exception as e:
