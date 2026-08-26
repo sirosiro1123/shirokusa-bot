@@ -27,6 +27,10 @@ senseki.py
   11. /攻略記事登録・/攻略記事一覧・/攻略記事削除（管理者専用）：
       対面ごとのおすすめ記事URLを管理する
 
+  12. /戦績パネル設置（管理者専用）：チャンネルに「戦績を記録する」ボタンを
+      1つ常設する。押した人にだけ /戦績 と同じ入力画面が開く（永続ビュー、
+      custom_id固定でBOT再起動後も動作し続ける）
+
 【メンバー限定機能について】
   MEMBER_ROLE_IDS（カンマ区切りの環境変数）で判定する。飯テロBOTと同じ方式。
   未設定だと /弱点対面 は誰にも使えない（is_member が常にFalseを返すため）。
@@ -1064,6 +1068,42 @@ class TemplateView(discord.ui.View):
 
 
 # ==============================
+# 常設パネル（/戦績パネル設置 で1回置く。ボタンは押した人にだけ反応する）
+# ==============================
+
+PANEL_BUTTON_CUSTOM_ID = "senseki_panel_record_v1"
+
+
+class SensekiPanelButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="戦績を記録する",
+            style=discord.ButtonStyle.primary,
+            emoji="⚔️",
+            custom_id=PANEL_BUTTON_CUSTOM_ID,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("SensekiCog")
+        if cog is None:
+            await interaction.response.send_message(
+                "内部エラー：SensekiCogが見つかりません。", ephemeral=True
+            )
+            return
+        # ここでのレスポンスは押した本人にだけ見える（ephemeral）。
+        # パネル本体（誰でも見えるメッセージ）は書き換えない。
+        await cog._start_record_flow(interaction)
+
+
+class SensekiPanelView(discord.ui.View):
+    """timeout=None＋固定custom_idで永続化。BOT再起動後もボタンが反応し続ける"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(SensekiPanelButton())
+
+
+# ==============================
 # Excel（生データ＋集計）の生成
 # ==============================
 
@@ -1145,6 +1185,9 @@ class SensekiCog(commands.Cog):
             self.daily_sheets_sync.start()
         if not self.debounced_sheets_sync.is_running():
             self.debounced_sheets_sync.start()
+        # 永続ビューの登録。custom_idが一致すれば、BOT再起動後も
+        # 過去に送信済みのパネルのボタンが反応し続ける
+        self.bot.add_view(SensekiPanelView())
         # BOT再起動をまたいでも掲示板が最新になるよう一度更新しておく
         try:
             await self._update_board()
@@ -1155,6 +1198,30 @@ class SensekiCog(commands.Cog):
         self.weekly_export.cancel()
         self.daily_sheets_sync.cancel()
         self.debounced_sheets_sync.cancel()
+
+    @app_commands.command(
+        name="戦績パネル設置",
+        description="このチャンネルに「戦績を記録する」ボタンを常設します（管理者専用）",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def senseki_panel_setup(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        message = await interaction.channel.send(
+            content=(
+                "⚔️ **戦績記録パネル**\n"
+                "下のボタンから対戦結果を記録できます。押した人にだけ入力画面が表示されます。\n"
+                "-# 初回は `/戦績設定` で先にデッキ・ランクを登録してください。"
+            ),
+            view=SensekiPanelView(),
+        )
+        try:
+            await message.pin()
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "パネルは作成しましたが、ピン留めの権限がなかったため手動で留めてください。",
+                ephemeral=True,
+            )
+        await interaction.followup.send("✅ パネルを設置しました。", ephemeral=True)
 
     # ---- 現状掲示板（全プレイヤーのデッキ＆ランク一覧） ----
 
@@ -1635,9 +1702,8 @@ class SensekiCog(commands.Cog):
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
         await self._update_board()
 
-    # ---- /戦績 ----
-    @app_commands.command(name="戦績", description="対戦結果を記録します")
-    async def senseki_record(self, interaction: discord.Interaction):
+    async def _start_record_flow(self, interaction: discord.Interaction):
+        """記録の入り口。/戦績 とパネルのボタンの両方から呼ぶ"""
         settings = await get_user_settings(str(interaction.user.id))
         if settings is None:
             await interaction.response.send_message(
@@ -1655,6 +1721,11 @@ class SensekiCog(commands.Cog):
             view=view,
             ephemeral=True,
         )
+
+    # ---- /戦績 ----
+    @app_commands.command(name="戦績", description="対戦結果を記録します")
+    async def senseki_record(self, interaction: discord.Interaction):
+        await self._start_record_flow(interaction)
 
     # ---- /戦績取消 ----
     @app_commands.command(name="戦績取消", description="直前に記録した1件を取り消します")
