@@ -22,8 +22,9 @@ senseki.py
   9. /戦績板設置（管理者専用）：全員の使用デッキ＆ランクを1メッセージに
      常時表示する掲示板を作る。/戦績設定・/デッキ切替・/ランク更新の
      どれかが実行されるたびに自動で書き換わる（新規投稿ではなく編集）
-  10. /弱点対面（メンバー限定）：自分の対面別勝率の低い相手を抽出し、
+  10. /弱点対面：自分の対面別勝率の低い相手を抽出し、
       登録済みの攻略記事があれば一緒に表示する（3戦以上・参考値扱い）
+      現状は誰でも使える。切り替え方法は下記「有料化スイッチ」を参照
   11. /攻略記事登録・/攻略記事一覧・/攻略記事削除（管理者専用）：
       対面ごとのおすすめ記事URLを管理する
 
@@ -31,9 +32,14 @@ senseki.py
       1つ常設する。押した人にだけ /戦績 と同じ入力画面が開く（永続ビュー、
       custom_id固定でBOT再起動後も動作し続ける）
 
-【メンバー限定機能について】
-  MEMBER_ROLE_IDS（カンマ区切りの環境変数）で判定する。飯テロBOTと同じ方式。
-  未設定だと /弱点対面 は誰にも使えない（is_member が常にFalseを返すため）。
+【有料化スイッチについて（/弱点対面 の公開範囲）】
+  現状は誰でも使える。有料化のタイミングで Railway の環境変数に
+    SENSEKI_MEMBERS_ONLY=true
+  を追加して再デプロイするだけで、コードを触らずメンバー限定に切り替わる。
+  メンバー判定は MEMBER_ROLE_IDS（カンマ区切りの環境変数、飯テロBOTと同じ方式）。
+  スイッチをオンにする前に MEMBER_ROLE_IDS が未設定だと、誰も条件を満たせず
+  実質「使用不可」になってしまうので、オンにするときは MEMBER_ROLE_IDS が
+  正しく設定されていることを先に確認すること。
 
 フェーズ2以降で追加するもの（このファイルには未実装）
   - 環境ID管理と /環境切替（現状は CURRENT_ENV_ID を固定値で使用）
@@ -171,6 +177,17 @@ def is_member(user: discord.Member) -> bool:
     if not isinstance(user, discord.Member):
         return False
     return any(r.id in MEMBER_ROLE_IDS for r in user.roles)
+
+
+# メンバー限定機能の「有料化スイッチ」
+# 運用開始時は誰でも使える。有料化のタイミングでRailwayの環境変数に
+#   SENSEKI_MEMBERS_ONLY=true
+# を追加して再デプロイするだけで、コードを触らずメンバー限定に切り替わる。
+# MEMBER_ROLE_IDS 側は事前に設定しておいても、このスイッチがオフの間は無効。
+def _parse_bool(raw: str) -> bool:
+    return (raw or "").strip().lower() in ("1", "true", "yes", "on")
+
+SENSEKI_MEMBERS_ONLY = _parse_bool(os.environ.get("SENSEKI_MEMBERS_ONLY", ""))
 
 # 記録・取消のあと、何秒待ってからシートへ反映するか
 # 0にすると毎試合すぐ書きに行くが、連戦時にGoogle側のAPI制限に触れる。
@@ -1071,7 +1088,10 @@ class TemplateView(discord.ui.View):
 # 常設パネル（/戦績パネル設置 で1回置く。ボタンは押した人にだけ反応する）
 # ==============================
 
-PANEL_BUTTON_CUSTOM_ID = "senseki_panel_record_v1"
+PANEL_RECORD_CUSTOM_ID = "senseki_panel_record_v1"
+PANEL_DECK_SWITCH_CUSTOM_ID = "senseki_panel_deck_switch_v1"
+PANEL_RANK_UPDATE_CUSTOM_ID = "senseki_panel_rank_update_v1"
+PANEL_UNDO_CUSTOM_ID = "senseki_panel_undo_v1"
 
 
 class SensekiPanelButton(discord.ui.Button):
@@ -1080,7 +1100,7 @@ class SensekiPanelButton(discord.ui.Button):
             label="戦績を記録する",
             style=discord.ButtonStyle.primary,
             emoji="⚔️",
-            custom_id=PANEL_BUTTON_CUSTOM_ID,
+            custom_id=PANEL_RECORD_CUSTOM_ID,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1095,12 +1115,153 @@ class SensekiPanelButton(discord.ui.Button):
         await cog._start_record_flow(interaction)
 
 
+class PanelDeckSwitchButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="デッキ切替",
+            style=discord.ButtonStyle.secondary,
+            emoji="🔄",
+            custom_id=PANEL_DECK_SWITCH_CUSTOM_ID,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = str(interaction.user.id)
+        settings = await get_user_settings(user_id)
+        if settings is None:
+            await interaction.response.send_message(
+                "先に `/戦績設定` で初期設定をしてください。", ephemeral=True
+            )
+            return
+        templates = await list_templates(user_id)
+        if not templates:
+            await interaction.response.send_message(
+                "登録済みのデッキがありません。`/デッキ登録` で登録してください。",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "使うデッキを選んでください。", view=TemplateView(templates, "switch"), ephemeral=True
+        )
+
+
+class PanelRankTierSelect(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label=r, value=r) for r in RANK_TIER_CHOICES]
+        super().__init__(placeholder="ランク帯を選択", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        rank_value = self.values[0]
+
+        if rank_value == GRAND_MASTER_TIER:
+            view = discord.ui.View(timeout=180)
+            view.add_item(PanelGradeSelect(rank_value))
+            await interaction.response.edit_message(
+                content=(
+                    f"ランク帯：**{rank_value}**\n"
+                    f"グレードを選択してください（付いていなければ"
+                    f"「{CR_GRADE_NONE_LABEL}」でOK）。"
+                ),
+                view=view,
+            )
+            return
+
+        ok = await update_rank(str(interaction.user.id), rank_value, None)
+        if not ok:
+            await interaction.response.edit_message(
+                content="先に `/戦績設定` で初期設定をしてください。", view=None
+            )
+            return
+        await interaction.response.edit_message(
+            content=f"✅ ランク帯を更新しました：{rank_value}", view=None
+        )
+        cog = interaction.client.get_cog("SensekiCog")
+        if cog is not None:
+            await cog._update_board()
+
+
+class PanelGradeSelect(discord.ui.Select):
+    def __init__(self, rank_value: str):
+        self.rank_value = rank_value
+        options = (
+            [discord.SelectOption(label=CR_GRADE_NONE_LABEL, value=CR_GRADE_NONE_VALUE)]
+            + [discord.SelectOption(label=g, value=g) for g in CR_GRADE_CHOICES]
+        )
+        super().__init__(placeholder="グレードを選択", options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        raw_grade = self.values[0]
+        grade_value, _note, _error = _resolve_grade(self.rank_value, raw_grade)
+
+        ok = await update_rank(str(interaction.user.id), self.rank_value, grade_value)
+        if not ok:
+            await interaction.response.edit_message(
+                content="先に `/戦績設定` で初期設定をしてください。", view=None
+            )
+            return
+        label = f"{self.rank_value}（{grade_value}）" if grade_value else f"{self.rank_value}・グレードなし"
+        await interaction.response.edit_message(
+            content=f"✅ ランク帯を更新しました：{label}", view=None
+        )
+        cog = interaction.client.get_cog("SensekiCog")
+        if cog is not None:
+            await cog._update_board()
+
+
+class PanelRankUpdateButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="ランク更新",
+            style=discord.ButtonStyle.secondary,
+            emoji="📈",
+            custom_id=PANEL_RANK_UPDATE_CUSTOM_ID,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        settings = await get_user_settings(str(interaction.user.id))
+        if settings is None:
+            await interaction.response.send_message(
+                "先に `/戦績設定` で初期設定をしてください。", ephemeral=True
+            )
+            return
+        view = discord.ui.View(timeout=180)
+        view.add_item(PanelRankTierSelect())
+        await interaction.response.send_message(
+            "ランク帯を選んでください。", view=view, ephemeral=True
+        )
+
+
+class PanelUndoButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="直前の記録を取消",
+            style=discord.ButtonStyle.danger,
+            emoji="↩️",
+            custom_id=PANEL_UNDO_CUSTOM_ID,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        deleted = await delete_last_match(str(interaction.user.id))
+        if deleted is None:
+            await interaction.response.send_message(
+                "取り消せる記録が見つかりませんでした。", ephemeral=True
+            )
+            return
+        result_label = "勝ち" if deleted["is_win"] else "負け"
+        await interaction.response.send_message(
+            f"🗑️ 直前の記録を取り消しました\n相手クラス：{deleted['opp_class']} / {result_label}",
+            ephemeral=True,
+        )
+
+
 class SensekiPanelView(discord.ui.View):
     """timeout=None＋固定custom_idで永続化。BOT再起動後もボタンが反応し続ける"""
 
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(SensekiPanelButton())
+        self.add_item(PanelDeckSwitchButton())
+        self.add_item(PanelRankUpdateButton())
+        self.add_item(PanelUndoButton())
 
 
 # ==============================
@@ -1209,7 +1370,11 @@ class SensekiCog(commands.Cog):
         message = await interaction.channel.send(
             content=(
                 "⚔️ **戦績記録パネル**\n"
-                "下のボタンから対戦結果を記録できます。押した人にだけ入力画面が表示されます。\n"
+                "ボタンはすべて押した人にだけ画面が表示されます。\n"
+                "・⚔️ 戦績を記録する\n"
+                "・🔄 デッキ切替\n"
+                "・📈 ランク更新\n"
+                "・↩️ 直前の記録を取消\n"
                 "-# 初回は `/戦績設定` で先にデッキ・ランクを登録してください。"
             ),
             view=SensekiPanelView(),
@@ -1742,13 +1907,14 @@ class SensekiCog(commands.Cog):
             ephemeral=True,
         )
 
-    # ---- /弱点対面（メンバー限定） ----
+    # ---- /弱点対面 ----
+    # SENSEKI_MEMBERS_ONLY が true になるまでは誰でも使える
     @app_commands.command(
         name="弱点対面",
-        description="【メンバー限定】あなたの対面別の勝率が低い相手と、おすすめの攻略記事を表示します",
+        description="あなたの対面別の勝率が低い相手と、おすすめの攻略記事を表示します",
     )
     async def weak_matchups(self, interaction: discord.Interaction):
-        if not is_member(interaction.user):
+        if SENSEKI_MEMBERS_ONLY and not is_member(interaction.user):
             await interaction.response.send_message(
                 "この機能はメンバー限定です。メンバーシップについては固定メッセージをご確認ください。",
                 ephemeral=True,
