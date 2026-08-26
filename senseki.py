@@ -11,6 +11,14 @@ senseki.py
   3. /戦績（ボタン形式のみ）
   4. /戦績取消
   5. /戦績確認（自分の勝率のみ。クラス別・対面別の内訳はフェーズ2）
+  6. /戦績データ抽出（管理者専用）：生データ＋ユーザー別集計をExcel（xlsx）で出力
+     毎週月曜9:00（JST）に現環境分を管理者DMへ自動送信もする
+  7. /戦績全体（管理者専用）：その瞬間のDBから全体集計を出す
+     クラス別・対面別・先後別。シートを見なくてもDiscord上で完結する
+  8. /戦績シート同期・/戦績シート診断（管理者専用）：Googleスプレッドシートへ同期
+     記録・取消があると SHEETS_DEBOUNCE_SECONDS 後にまとめて自動反映。
+     加えて毎日9:30（JST）にも同期する（環境変数が未設定なら何もしない）
+     詳細は senseki_sheets.py を参照
 
 フェーズ2以降で追加するもの（このファイルには未実装）
   - 環境ID管理と /環境切替（現状は CURRENT_ENV_ID を固定値で使用）
@@ -27,13 +35,28 @@ Railway の shirokusa-bot サービスに永続ボリューム（マウントパ
 """
 
 import asyncio
+import io
 import os
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
+
+try:
+    from openpyxl import Workbook
+    OPENPYXL_IMPORT_ERROR = None
+except Exception as _e:  # ライブラリ未導入時に起動を止めない
+    Workbook = None
+    OPENPYXL_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+try:
+    import senseki_sheets
+    SHEETS_MODULE_ERROR = None
+except Exception as _e:  # モジュール未配置でも起動を止めない
+    senseki_sheets = None
+    SHEETS_MODULE_ERROR = f"{type(_e).__name__}: {_e}"
 
 # ==============================
 # 設定
@@ -83,6 +106,47 @@ GRAND_MASTER_TIER = "グランドマスター"
 # 新弾リリース（2026-08-27）に合わせて設定。新弾切り替わり後に変更する場合は
 # ここを書き換えてから再デプロイすること。
 CURRENT_ENV_ID = "2026-08-beyond-2"
+
+# 集計データの定期抽出先（管理者DM）
+# しろくさのユーザーID（koken_rank.py の ADOPT_JUDGE_USER_ID と同じ値）
+SENSEKI_ADMIN_USER_ID = 346475730458378240
+
+# 定期抽出のタイミング（JST）
+WEEKLY_EXPORT_WEEKDAY = 0   # 0=月曜
+WEEKLY_EXPORT_HOUR = 9
+WEEKLY_EXPORT_MINUTE = 0
+
+# Googleスプレッドシートへの日次同期のタイミング（JST）
+# 環境変数が未設定なら同期はスキップされる（senseki_sheets.py 参照）
+SHEETS_SYNC_HOUR = 9
+SHEETS_SYNC_MINUTE = 30
+
+# 統計として扱える最低試合数（仕様書 8-3）
+# フェーズ3の /戦績比較 ではこの値を下回る対面は数字を出さない
+MIN_SAMPLE_FOR_STATS = 30
+
+# 記録・取消のあと、何秒待ってからシートへ反映するか
+# 0にすると毎試合すぐ書きに行くが、連戦時にGoogle側のAPI制限に触れる。
+# 待つ間に複数の記録が入れば1回の同期にまとめられる（まとめ書き）。
+SHEETS_DEBOUNCE_SECONDS = 60
+
+# データが変わったことを同期タスクに知らせるフラグ
+# insert_match / delete_last_match から立てる
+_sheets_dirty = False
+
+
+def mark_dirty():
+    """戦績データが変わったことを記録する"""
+    global _sheets_dirty
+    _sheets_dirty = True
+
+
+def take_dirty() -> bool:
+    """フラグを読んで下ろす"""
+    global _sheets_dirty
+    was = _sheets_dirty
+    _sheets_dirty = False
+    return was
 
 
 # ==============================
@@ -218,6 +282,7 @@ def _insert_match_sync(user_id: str, settings: dict, opp_class: str, is_first: b
 
 async def insert_match(user_id: str, settings: dict, opp_class: str, is_first: bool, is_win: bool):
     await asyncio.to_thread(_insert_match_sync, user_id, settings, opp_class, is_first, is_win)
+    mark_dirty()
 
 
 def _delete_last_match_sync(user_id: str):
@@ -238,7 +303,10 @@ def _delete_last_match_sync(user_id: str):
 
 
 async def delete_last_match(user_id: str):
-    return await asyncio.to_thread(_delete_last_match_sync, user_id)
+    result = await asyncio.to_thread(_delete_last_match_sync, user_id)
+    if result is not None:
+        mark_dirty()
+    return result
 
 
 def _get_summary_sync(user_id: str):
@@ -260,6 +328,80 @@ def _get_summary_sync(user_id: str):
 
 async def get_summary(user_id: str):
     return await asyncio.to_thread(_get_summary_sync, user_id)
+
+
+def _fetch_all_matches_sync(env_only: bool):
+    conn = _connect()
+    try:
+        if env_only:
+            rows = conn.execute(
+                "SELECT * FROM matches WHERE env_id = ? ORDER BY id", (CURRENT_ENV_ID,)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM matches ORDER BY id").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def fetch_all_matches(env_only: bool = True):
+    return await asyncio.to_thread(_fetch_all_matches_sync, env_only)
+
+
+def _fetch_all_user_settings_sync():
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT * FROM user_settings").fetchall()
+        return {r["user_id"]: dict(r) for r in rows}
+    finally:
+        conn.close()
+
+
+async def fetch_all_user_settings():
+    return await asyncio.to_thread(_fetch_all_user_settings_sync)
+
+
+def _get_global_summary_sync():
+    """現環境の全体集計。クラス別・先後別まで一度に出す"""
+    conn = _connect()
+    try:
+        total_row = conn.execute("""
+            SELECT COUNT(*) AS total, SUM(is_win) AS wins,
+                   COUNT(DISTINCT user_id) AS users
+            FROM matches WHERE env_id = ?
+        """, (CURRENT_ENV_ID,)).fetchone()
+
+        by_first = conn.execute("""
+            SELECT is_first, COUNT(*) AS total, SUM(is_win) AS wins
+            FROM matches WHERE env_id = ? GROUP BY is_first
+        """, (CURRENT_ENV_ID,)).fetchall()
+
+        by_my_class = conn.execute("""
+            SELECT my_class, COUNT(*) AS total, SUM(is_win) AS wins
+            FROM matches WHERE env_id = ?
+            GROUP BY my_class ORDER BY total DESC
+        """, (CURRENT_ENV_ID,)).fetchall()
+
+        by_opp_class = conn.execute("""
+            SELECT opp_class, COUNT(*) AS total, SUM(is_win) AS wins
+            FROM matches WHERE env_id = ?
+            GROUP BY opp_class ORDER BY total DESC
+        """, (CURRENT_ENV_ID,)).fetchall()
+
+        return {
+            "total": total_row["total"] or 0,
+            "wins": total_row["wins"] or 0,
+            "users": total_row["users"] or 0,
+            "by_first": [dict(r) for r in by_first],
+            "by_my_class": [dict(r) for r in by_my_class],
+            "by_opp_class": [dict(r) for r in by_opp_class],
+        }
+    finally:
+        conn.close()
+
+
+async def get_global_summary():
+    return await asyncio.to_thread(_get_global_summary_sync)
 
 
 # ==============================
@@ -387,6 +529,71 @@ class SensekiFlowView(discord.ui.View):
 
 
 # ==============================
+# Excel（生データ＋集計）の生成
+# ==============================
+
+def _resolve_display_name(guild, user_id: str) -> str:
+    if guild is not None:
+        member = guild.get_member(int(user_id))
+        if member is not None:
+            return member.display_name
+    return f"不明なユーザー（{user_id}）"
+
+
+def build_workbook(matches: list[dict], guild) -> bytes:
+    """生データシートと集計シートを持つxlsxをバイト列で返す"""
+    wb = Workbook()
+
+    # ---- 生データ ----
+    ws_raw = wb.active
+    ws_raw.title = "生データ"
+    ws_raw.append([
+        "記録日時", "ユーザー", "ユーザーID", "環境ID", "フォーマット",
+        "自分のクラス", "自分のデッキ", "ランク帯", "グレード",
+        "相手クラス", "先攻/後攻", "勝敗",
+    ])
+    for m in matches:
+        ws_raw.append([
+            m["recorded_at"],
+            _resolve_display_name(guild, m["user_id"]),
+            m["user_id"],
+            m["env_id"],
+            FORMAT_LABELS.get(m["format"], m["format"]),
+            m["my_class"],
+            m.get("my_deck") or "",
+            m.get("rank_tier") or "",
+            m.get("cr_grade") or "",
+            m["opp_class"],
+            "先攻" if m["is_first"] else "後攻",
+            "勝ち" if m["is_win"] else "負け",
+        ])
+
+    # ---- 集計（ユーザー別） ----
+    ws_agg = wb.create_sheet("集計")
+    ws_agg.append(["ユーザー", "ユーザーID", "試合数", "勝数", "敗数", "勝率(%)"])
+
+    per_user: dict[str, dict] = {}
+    for m in matches:
+        uid = m["user_id"]
+        row = per_user.setdefault(uid, {"total": 0, "wins": 0})
+        row["total"] += 1
+        row["wins"] += m["is_win"]
+
+    for uid, row in sorted(per_user.items(), key=lambda kv: -kv[1]["total"]):
+        total = row["total"]
+        wins = row["wins"]
+        losses = total - wins
+        win_rate = round(wins / total * 100, 1) if total else 0.0
+        ws_agg.append([
+            _resolve_display_name(guild, uid), uid, total, wins, losses, win_rate,
+        ])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+# ==============================
 # Cog本体
 # ==============================
 
@@ -396,6 +603,248 @@ class SensekiCog(commands.Cog):
 
     async def cog_load(self):
         await init_db()
+        if not self.weekly_export.is_running():
+            self.weekly_export.start()
+        if not self.daily_sheets_sync.is_running():
+            self.daily_sheets_sync.start()
+        if not self.debounced_sheets_sync.is_running():
+            self.debounced_sheets_sync.start()
+
+    def cog_unload(self):
+        self.weekly_export.cancel()
+        self.daily_sheets_sync.cancel()
+        self.debounced_sheets_sync.cancel()
+
+    # ---- Googleスプレッドシート同期 ----
+
+    def _name_resolver(self):
+        guild = self.bot.get_guild(GUILD_ID)
+
+        def resolve(user_id: str) -> str:
+            if guild is not None:
+                member = guild.get_member(int(user_id))
+                if member is not None:
+                    return member.display_name
+            return f"不明なユーザー（{user_id}）"
+
+        return resolve
+
+    async def _run_sheets_sync(self) -> dict:
+        matches = await fetch_all_matches(env_only=False)
+        return await asyncio.to_thread(
+            senseki_sheets.sync_to_sheets, matches, FORMAT_LABELS, self._name_resolver()
+        )
+
+    @tasks.loop(time=dtime(hour=SHEETS_SYNC_HOUR, minute=SHEETS_SYNC_MINUTE, tzinfo=JST))
+    async def daily_sheets_sync(self):
+        if senseki_sheets is None or not senseki_sheets.is_configured():
+            return  # 未設定なら静かにスキップ（毎日ログを汚さない）
+        try:
+            result = await self._run_sheets_sync()
+            print(f"✅ 戦績スプレッドシート同期完了: {result['raw']}件 / {result['users']}名")
+        except Exception as e:
+            print(f"⚠️ 戦績スプレッドシート同期に失敗しました: {type(e).__name__}: {e}")
+
+    @daily_sheets_sync.before_loop
+    async def _before_daily_sheets_sync(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(seconds=SHEETS_DEBOUNCE_SECONDS)
+    async def debounced_sheets_sync(self):
+        """記録・取消があった時だけシートへ反映する（まとめ書き）"""
+        if senseki_sheets is None or not senseki_sheets.is_configured():
+            return
+        if not take_dirty():
+            return  # 変更がなければAPIを呼ばない
+        try:
+            await self._run_sheets_sync()
+        except Exception as e:
+            print(f"⚠️ 戦績スプレッドシートの自動同期に失敗しました: {type(e).__name__}: {e}")
+            mark_dirty()  # 次の周回で再試行する
+
+    @debounced_sheets_sync.before_loop
+    async def _before_debounced_sheets_sync(self):
+        await self.bot.wait_until_ready()
+
+    @app_commands.command(
+        name="戦績シート同期",
+        description="戦績データをGoogleスプレッドシートへ即時同期します（管理者専用）",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def senseki_sheets_sync(self, interaction: discord.Interaction):
+        if senseki_sheets is None:
+            await interaction.response.send_message(
+                f"senseki_sheets.py を読み込めませんでした。\n```\n{SHEETS_MODULE_ERROR}\n```",
+                ephemeral=True,
+            )
+            return
+
+        if not senseki_sheets.is_configured():
+            await interaction.response.send_message(
+                "スプレッドシート連携の設定が未完了です。\n"
+                f"```\n{senseki_sheets.describe_config()}\n```\n"
+                "Railway の Variables と requirements.txt を確認してください。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            result = await self._run_sheets_sync()
+            await interaction.followup.send(
+                f"✅ 同期しました（{result['raw']}件 / {result['users']}名）\n{result['url']}",
+                ephemeral=True,
+            )
+        except Exception as e:
+            print(f"⚠️ 戦績シート同期でエラー: {type(e).__name__}: {e}")
+            hint = ""
+            if "403" in str(e) or "PERMISSION" in str(e).upper():
+                hint = (
+                    "\n\nスプレッドシートがサービスアカウントに共有されていない可能性があります。"
+                    "`/戦績シート診断` でメールアドレスを確認し、そのアドレスに"
+                    "「編集者」権限で共有してください。"
+                )
+            await interaction.followup.send(
+                f"同期に失敗しました。\n```\n{type(e).__name__}: {e}\n```{hint}",
+                ephemeral=True,
+            )
+
+    @app_commands.command(
+        name="戦績シート診断",
+        description="スプレッドシート連携の設定状況を確認します（管理者専用）",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def senseki_sheets_diag(self, interaction: discord.Interaction):
+        if senseki_sheets is None:
+            await interaction.response.send_message(
+                f"senseki_sheets.py を読み込めませんでした。\n```\n{SHEETS_MODULE_ERROR}\n```",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "```\n" + senseki_sheets.describe_config() + "\n```\n"
+            "サービスアカウントのメールアドレスに、対象スプレッドシートを"
+            "「編集者」で共有しておく必要があります。",
+            ephemeral=True,
+        )
+
+    async def _build_export(self, env_only: bool) -> tuple[bytes, str, int]:
+        matches = await fetch_all_matches(env_only=env_only)
+        guild = self.bot.get_guild(GUILD_ID)
+        data = await asyncio.to_thread(build_workbook, matches, guild)
+        scope = "現環境" if env_only else "全期間"
+        filename = f"senseki_{scope}_{datetime.now(JST).strftime('%Y%m%d_%H%M')}.xlsx"
+        return data, filename, len(matches)
+
+    @tasks.loop(time=dtime(hour=WEEKLY_EXPORT_HOUR, minute=WEEKLY_EXPORT_MINUTE, tzinfo=JST))
+    async def weekly_export(self):
+        if datetime.now(JST).weekday() != WEEKLY_EXPORT_WEEKDAY:
+            return
+        if SENSEKI_ADMIN_USER_ID == 0:
+            print("⚠️ SENSEKI_ADMIN_USER_ID が未設定のため、戦績データの週次送信をスキップしました")
+            return
+        if Workbook is None:
+            print(f"⚠️ openpyxl が読み込めないため、戦績データの週次送信をスキップしました: {OPENPYXL_IMPORT_ERROR}")
+            return
+        try:
+            data, filename, count = await self._build_export(env_only=True)
+            admin = self.bot.get_user(SENSEKI_ADMIN_USER_ID) or await self.bot.fetch_user(SENSEKI_ADMIN_USER_ID)
+            await admin.send(
+                content=f"📊 戦績データ週次抽出（現環境・{count}件）",
+                file=discord.File(io.BytesIO(data), filename=filename),
+            )
+        except Exception as e:
+            print(f"⚠️ 戦績データの週次送信に失敗しました: {type(e).__name__}: {e}")
+
+    @weekly_export.before_loop
+    async def _before_weekly_export(self):
+        await self.bot.wait_until_ready()
+
+    # ---- /戦績データ抽出 ----
+    @app_commands.command(name="戦績データ抽出", description="戦績データを生データ＋集計のExcelで出力します（管理者専用）")
+    @app_commands.describe(全期間="オンにすると環境をまたいだ全データを出力します（既定は現環境のみ）")
+    @app_commands.default_permissions(administrator=True)
+    async def senseki_export(self, interaction: discord.Interaction, 全期間: bool = False):
+        if Workbook is None:
+            await interaction.response.send_message(
+                f"openpyxlが読み込めませんでした。\n```\n{OPENPYXL_IMPORT_ERROR}\n```\n"
+                "requirements.txt に `openpyxl` を追加してください。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            data, filename, count = await self._build_export(env_only=not 全期間)
+            if count == 0:
+                await interaction.followup.send("記録がまだありません。", ephemeral=True)
+                return
+
+            summary = f"📊 戦績データ抽出（{'全期間' if 全期間 else '現環境'}・{count}件）"
+            try:
+                await interaction.user.send(
+                    content=summary,
+                    file=discord.File(io.BytesIO(data), filename=filename),
+                )
+                await interaction.followup.send("DMにExcelを送付しました。", ephemeral=True)
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    content=f"DMを送信できなかったため、こちらに添付します。\n\n{summary}",
+                    file=discord.File(io.BytesIO(data), filename=filename),
+                    ephemeral=True,
+                )
+        except Exception as e:
+            print(f"⚠️ 戦績データ抽出で予期しないエラー: {type(e).__name__}: {e}")
+            await interaction.followup.send(
+                f"処理中にエラーが発生しました。\n```\n{type(e).__name__}: {e}\n```",
+                ephemeral=True,
+            )
+
+    # ---- /戦績全体 ----
+    @app_commands.command(
+        name="戦績全体",
+        description="サーバー全体の集計を今この瞬間のデータで表示します（管理者専用）",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def senseki_global(self, interaction: discord.Interaction):
+        g = await get_global_summary()
+        total = g["total"]
+        if total == 0:
+            await interaction.response.send_message(
+                "まだ記録がありません。", ephemeral=True
+            )
+            return
+
+        def rate(wins, n):
+            return f"{wins / n * 100:.1f}%" if n else "-"
+
+        lines = [
+            "📊 **全体集計（現環境）**",
+            f"{total}戦 / {g['wins']}勝{total - g['wins']}敗 / 勝率 {rate(g['wins'], total)}",
+            f"記録者：{g['users']}名",
+        ]
+
+        first_map = {r["is_first"]: r for r in g["by_first"]}
+        parts = []
+        for key, label in ((1, "先攻"), (0, "後攻")):
+            r = first_map.get(key)
+            if r:
+                parts.append(f"{label} {rate(r['wins'], r['total'])}（{r['total']}戦）")
+        if parts:
+            lines.append("\n**先後別**\n" + " / ".join(parts))
+
+        lines.append("\n**使用クラス別**")
+        for r in g["by_my_class"]:
+            lines.append(f"{r['my_class']}：{rate(r['wins'], r['total'])}（{r['total']}戦）")
+
+        lines.append("\n**対面クラス別**")
+        for r in g["by_opp_class"]:
+            lines.append(f"vs {r['opp_class']}：{rate(r['wins'], r['total'])}（{r['total']}戦）")
+
+        lines.append(
+            f"\n※母数が少ない項目は参考値です（{MIN_SAMPLE_FOR_STATS}戦未満は特に）。"
+        )
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     # ---- /戦績設定 ----
     @app_commands.command(name="戦績設定", description="フォーマット・自分のクラス・デッキタイプ・ランク帯を登録します")
@@ -531,6 +980,13 @@ async def setup(bot: commands.Bot):
 #   SENSEKI_DB_PATH … 既定値 /data/senseki.db。ボリュームのマウントパスが
 #                      違う場合のみ設定する
 #
+# 必要なライブラリ（requirements.txt に追加）:
+#   openpyxl
+#   gspread        … スプレッドシート連携を使う場合のみ
+#   google-auth    … 同上
+#
 # デプロイ前提条件:
 #   Railway の shirokusa-bot サービスに永続ボリューム（/data）が必要。
 #   未設定の場合は Volumes タブから追加してから反映すること。
+#
+# SENSEKI_ADMIN_USER_ID は設定済み（週次抽出のDM送付先）。

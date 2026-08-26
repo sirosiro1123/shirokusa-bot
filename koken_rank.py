@@ -39,7 +39,7 @@ ADOPT_EMOJI = "📌"
 
 # このユーザーが ADOPT_EMOJI を付けた投稿のみ「採用」として加点する
 # 0 のままなら、誰が付けたかを問わず加点する
-ADOPT_JUDGE_USER_ID = 0
+ADOPT_JUDGE_USER_ID = 346475730458378240
 
 # 遡る日数の既定値（アマギフ企画を月次で回す想定）
 DEFAULT_LOOKBACK_DAYS = 30
