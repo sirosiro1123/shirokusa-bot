@@ -22,6 +22,14 @@ senseki.py
   9. /戦績板設置（管理者専用）：全員の使用デッキ＆ランクを1メッセージに
      常時表示する掲示板を作る。/戦績設定・/デッキ切替・/ランク更新の
      どれかが実行されるたびに自動で書き換わる（新規投稿ではなく編集）
+  10. /弱点対面（メンバー限定）：自分の対面別勝率の低い相手を抽出し、
+      登録済みの攻略記事があれば一緒に表示する（3戦以上・参考値扱い）
+  11. /攻略記事登録・/攻略記事一覧・/攻略記事削除（管理者専用）：
+      対面ごとのおすすめ記事URLを管理する
+
+【メンバー限定機能について】
+  MEMBER_ROLE_IDS（カンマ区切りの環境変数）で判定する。飯テロBOTと同じ方式。
+  未設定だと /弱点対面 は誰にも使えない（is_member が常にFalseを返すため）。
 
 フェーズ2以降で追加するもの（このファイルには未実装）
   - 環境ID管理と /環境切替（現状は CURRENT_ENV_ID を固定値で使用）
@@ -132,8 +140,33 @@ SHEETS_SYNC_HOUR = 9
 SHEETS_SYNC_MINUTE = 30
 
 # 統計として扱える最低試合数（仕様書 8-3）
-# フェーズ3の /戦績比較 ではこの値を下回る対面は数字を出さない
+# フェーズ3の /戦績全体 ではこの値を下回る対面は数字を出さない
 MIN_SAMPLE_FOR_STATS = 30
+
+# 個人の弱点対面表示の最低試合数
+# 30戦は運用初期には現実的でないため、個人向けは緩めにする。
+# その代わり画面上に「参考値」であることを明記する。
+MIN_SAMPLE_PERSONAL = 3
+
+# メンバー限定機能の判定に使うロールID（カンマ区切り、環境変数）
+# 飯テロBOTの MEMBER_ROLE_IDS と同じ方式
+def _parse_role_ids(raw: str) -> set:
+    ids = set()
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+MEMBER_ROLE_IDS = _parse_role_ids(os.environ.get("MEMBER_ROLE_IDS", ""))
+
+
+def is_member(user: discord.Member) -> bool:
+    if not MEMBER_ROLE_IDS:
+        return False
+    if not isinstance(user, discord.Member):
+        return False
+    return any(r.id in MEMBER_ROLE_IDS for r in user.roles)
 
 # 記録・取消のあと、何秒待ってからシートへ反映するか
 # 0にすると毎試合すぐ書きに行くが、連戦時にGoogle側のAPI制限に触れる。
@@ -229,6 +262,17 @@ def _init_db_sync():
             if "cr_grade" not in cols:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN cr_grade TEXT")
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS guide_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                my_class TEXT NOT NULL DEFAULT '',
+                opp_class TEXT NOT NULL,
+                url TEXT NOT NULL,
+                note TEXT,
+                updated_at TEXT NOT NULL,
+                UNIQUE(my_class, opp_class)
+            )
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS bot_state (
                 key TEXT PRIMARY KEY,
@@ -573,6 +617,98 @@ def _set_state_sync(key: str, value: str):
 
 async def set_state(key: str, value: str):
     await asyncio.to_thread(_set_state_sync, key, value)
+
+
+# ---- 攻略記事リンク ----
+# my_class は空文字列("")で「自分のクラスを問わない汎用記事」を表す
+
+def _upsert_guide_link_sync(my_class: str, opp_class: str, url: str, note):
+    conn = _connect()
+    try:
+        now = datetime.now(JST).isoformat()
+        conn.execute("""
+            INSERT INTO guide_links (my_class, opp_class, url, note, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(my_class, opp_class) DO UPDATE SET
+                url = excluded.url, note = excluded.note, updated_at = excluded.updated_at
+        """, (my_class, opp_class, url, note, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def upsert_guide_link(my_class: str, opp_class: str, url: str, note=None):
+    await asyncio.to_thread(_upsert_guide_link_sync, my_class or "", opp_class, url, note)
+
+
+def _delete_guide_link_sync(my_class: str, opp_class: str) -> bool:
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "DELETE FROM guide_links WHERE my_class = ? AND opp_class = ?", (my_class, opp_class)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+async def delete_guide_link(my_class: str, opp_class: str) -> bool:
+    return await asyncio.to_thread(_delete_guide_link_sync, my_class or "", opp_class)
+
+
+def _list_guide_links_sync():
+    conn = _connect()
+    try:
+        rows = conn.execute("SELECT * FROM guide_links ORDER BY opp_class, my_class").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def list_guide_links():
+    return await asyncio.to_thread(_list_guide_links_sync)
+
+
+def _find_guide_link_sync(my_class: str, opp_class: str):
+    conn = _connect()
+    try:
+        # 1. クラス指定の記事を優先、2. なければ汎用（my_class=""）にフォールバック
+        row = conn.execute(
+            "SELECT * FROM guide_links WHERE my_class = ? AND opp_class = ?",
+            (my_class, opp_class),
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT * FROM guide_links WHERE my_class = '' AND opp_class = ?",
+                (opp_class,),
+            ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+async def find_guide_link(my_class: str, opp_class: str):
+    return await asyncio.to_thread(_find_guide_link_sync, my_class, opp_class)
+
+
+# ---- 個人の対面別集計（弱点対面の抽出用） ----
+
+def _get_personal_matchups_sync(user_id: str):
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT my_class, opp_class, COUNT(*) AS total, SUM(is_win) AS wins
+            FROM matches WHERE user_id = ? AND env_id = ?
+            GROUP BY my_class, opp_class
+        """, (user_id, CURRENT_ENV_ID)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def get_personal_matchups(user_id: str):
+    return await asyncio.to_thread(_get_personal_matchups_sync, user_id)
 
 
 def _get_global_summary_sync():
@@ -1535,28 +1671,138 @@ class SensekiCog(commands.Cog):
             ephemeral=True,
         )
 
+    # ---- /弱点対面（メンバー限定） ----
+    @app_commands.command(
+        name="弱点対面",
+        description="【メンバー限定】あなたの対面別の勝率が低い相手と、おすすめの攻略記事を表示します",
+    )
+    async def weak_matchups(self, interaction: discord.Interaction):
+        if not is_member(interaction.user):
+            await interaction.response.send_message(
+                "この機能はメンバー限定です。メンバーシップについては固定メッセージをご確認ください。",
+                ephemeral=True,
+            )
+            return
+
+        rows = await get_personal_matchups(str(interaction.user.id))
+        candidates = [r for r in rows if r["total"] >= MIN_SAMPLE_PERSONAL]
+        if not candidates:
+            await interaction.response.send_message(
+                f"まだ判定できるだけのデータがありません"
+                f"（同じ対面が{MIN_SAMPLE_PERSONAL}戦以上たまると表示されます）。",
+                ephemeral=True,
+            )
+            return
+
+        for r in candidates:
+            r["win_rate"] = r["wins"] / r["total"] * 100
+        candidates.sort(key=lambda r: r["win_rate"])
+        worst = candidates[:3]
+
+        lines = ["📉 **あなたの弱点対面**（現環境・参考値）"]
+        for r in worst:
+            lines.append(
+                f"\n**{r['my_class']}** vs **{r['opp_class']}**："
+                f"勝率 {r['win_rate']:.1f}%（{r['wins']}勝{r['total']-r['wins']}敗・{r['total']}戦）"
+            )
+            link = await find_guide_link(r["my_class"], r["opp_class"])
+            if link:
+                lines.append(f"📖 {link['url']}")
+                if link.get("note"):
+                    lines.append(f"　{link['note']}")
+
+        lines.append(
+            f"\n-# {MIN_SAMPLE_PERSONAL}戦以上あれば表示されますが、"
+            f"母数が少ないうちは参考程度に見てください。"
+        )
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    # ---- 攻略記事の管理（管理者専用） ----
+    @app_commands.command(name="攻略記事登録", description="対面ごとのおすすめ攻略記事を登録します（管理者専用）")
+    @app_commands.describe(
+        相手クラス="この相手クラスへの対策記事",
+        URL="記事のURL",
+        自分のクラス="任意：自分のクラスを指定すると、その組み合わせでのみ表示されます（省略時は相手クラス共通の記事）",
+        メモ="任意：一言コメント",
+    )
+    @app_commands.choices(相手クラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES])
+    @app_commands.choices(自分のクラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES])
+    @app_commands.default_permissions(administrator=True)
+    async def register_guide_link(
+        self,
+        interaction: discord.Interaction,
+        相手クラス: app_commands.Choice[str],
+        URL: str,
+        自分のクラス: app_commands.Choice[str] = None,
+        メモ: str = None,
+    ):
+        my_class = 自分のクラス.value if 自分のクラス else ""
+        await upsert_guide_link(my_class, 相手クラス.value, URL, メモ)
+        scope = f"{自分のクラス.name} vs {相手クラス.name}" if 自分のクラス else f"vs {相手クラス.name}（汎用）"
+        await interaction.response.send_message(f"✅ 登録しました：{scope}\n{URL}", ephemeral=True)
+
+    @app_commands.command(name="攻略記事一覧", description="登録済みの攻略記事を一覧表示します（管理者専用）")
+    @app_commands.default_permissions(administrator=True)
+    async def list_guide_links_cmd(self, interaction: discord.Interaction):
+        links = await list_guide_links()
+        if not links:
+            await interaction.response.send_message("まだ登録がありません。", ephemeral=True)
+            return
+        lines = ["📚 **登録済み攻略記事**"]
+        for l in links:
+            scope = f"{l['my_class']} vs {l['opp_class']}" if l["my_class"] else f"vs {l['opp_class']}（汎用）"
+            lines.append(f"・{scope}：{l['url']}")
+        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+    @app_commands.command(name="攻略記事削除", description="登録済みの攻略記事を削除します（管理者専用）")
+    @app_commands.describe(
+        相手クラス="削除する記事の相手クラス",
+        自分のクラス="任意：クラス指定ありで登録した記事を消す場合のみ指定",
+    )
+    @app_commands.choices(相手クラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES])
+    @app_commands.choices(自分のクラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES])
+    @app_commands.default_permissions(administrator=True)
+    async def delete_guide_link_cmd(
+        self,
+        interaction: discord.Interaction,
+        相手クラス: app_commands.Choice[str],
+        自分のクラス: app_commands.Choice[str] = None,
+    ):
+        my_class = 自分のクラス.value if 自分のクラス else ""
+        ok = await delete_guide_link(my_class, 相手クラス.value)
+        msg = "🗑️ 削除しました。" if ok else "該当する記事が見つかりませんでした。"
+        await interaction.response.send_message(msg, ephemeral=True)
+
     # ---- /戦績確認 ----
-    @app_commands.command(name="戦績確認", description="現在の環境での自分の勝率を確認します")
+    @app_commands.command(name="戦績確認", description="今使っているデッキ・ランクと、現環境での自分の勝率を確認します")
     async def senseki_check(self, interaction: discord.Interaction):
+        settings = await get_user_settings(str(interaction.user.id))
+        lines = []
+        if settings is not None:
+            deck = settings.get("my_deck") or "デッキ未設定"
+            rank = settings.get("rank_tier") or "ランク未設定"
+            if settings.get("cr_grade"):
+                rank += f"・{settings['cr_grade']}"
+            elif settings.get("rank_tier") == GRAND_MASTER_TIER:
+                rank += "・グレードなし"
+            lines.append(f"🧑 現在の設定：**{deck}**（{settings['my_class']}） / ランク：**{rank}**")
+            lines.append("")
+
         summary = await get_summary(str(interaction.user.id))
         total = summary["total"]
         if total == 0:
-            await interaction.response.send_message(
-                "まだ記録がありません。`/戦績` で記録してみてください。", ephemeral=True
-            )
+            lines.append("まだ記録がありません。`/戦績` で記録してみてください。")
+            await interaction.response.send_message("\n".join(lines), ephemeral=True)
             return
+
         wins = summary["wins"]
         losses = summary["losses"]
         win_rate = wins / total * 100
-        await interaction.response.send_message(
-            (
-                f"📊 現在の環境での戦績\n"
-                f"{wins}勝{losses}敗（{total}戦）\n"
-                f"勝率：{win_rate:.1f}%\n\n"
-                "※クラス別・対面別の内訳はフェーズ2で追加予定です。"
-            ),
-            ephemeral=True,
+        lines.append(
+            f"📊 現在の環境での戦績\n{wins}勝{losses}敗（{total}戦）\n勝率：{win_rate:.1f}%"
         )
+        lines.append("\n対面別の弱点は `/弱点対面` で確認できます（メンバー限定）。")
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
