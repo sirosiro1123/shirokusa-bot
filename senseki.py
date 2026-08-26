@@ -7,7 +7,7 @@ senseki.py
 
 フェーズ1で実装する範囲
   1. SQLiteのテーブル作成（matches / user_settings / deck_names）
-  2. /戦績設定
+  2. /戦績設定（全項目必須）／ /デッキ登録・/デッキ切替・/ランク更新
   3. /戦績（ボタン形式のみ）
   4. /戦績取消
   5. /戦績確認（自分の勝率のみ。クラス別・対面別の内訳はフェーズ2）
@@ -19,6 +19,9 @@ senseki.py
      記録・取消があると SHEETS_DEBOUNCE_SECONDS 後にまとめて自動反映。
      加えて毎日9:30（JST）にも同期する（環境変数が未設定なら何もしない）
      詳細は senseki_sheets.py を参照
+  9. /戦績板設置（管理者専用）：全員の使用デッキ＆ランクを1メッセージに
+     常時表示する掲示板を作る。/戦績設定・/デッキ切替・/ランク更新の
+     どれかが実行されるたびに自動で書き換わる（新規投稿ではなく編集）
 
 フェーズ2以降で追加するもの（このファイルには未実装）
   - 環境ID管理と /環境切替（現状は CURRENT_ENV_ID を固定値で使用）
@@ -96,6 +99,13 @@ RANK_TIER_CHOICES = [
 # BEYOND 1850以上かつCRランキング100位以内
 # CRはクラス別に算出されるため、/戦績設定 のクラスと対応する値を入れる。
 CR_GRADE_CHOICES = ["EPIC", "ULTIMATE", "LEGEND", "BEYOND"]
+
+# 「グレードなし」を表す選択肢の値
+# グランドマスター昇格直後のCR初期値は1100〜1600で、EPICの下限1650に届かない。
+# つまりグレードなしは例外ではなく通常の状態なので、明示的に選べるようにする。
+# 未入力での代用はしない（入力し忘れと区別できなくなるため）。
+CR_GRADE_NONE_VALUE = "__none__"
+CR_GRADE_NONE_LABEL = "グレードなし（CR1650未満）"
 
 # CRグレードを入力できるランク帯
 GRAND_MASTER_TIER = "グランドマスター"
@@ -193,6 +203,17 @@ def _init_db_sync():
             )
         """)
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS deck_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                format TEXT NOT NULL,
+                my_class TEXT NOT NULL,
+                deck_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id, format, my_class, deck_name)
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS deck_names (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 class_name TEXT NOT NULL,
@@ -208,6 +229,12 @@ def _init_db_sync():
             if "cr_grade" not in cols:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN cr_grade TEXT")
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_user_env ON matches(user_id, env_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_env_format ON matches(env_id, format)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_env_classes ON matches(env_id, my_class, opp_class)")
@@ -261,7 +288,29 @@ async def upsert_user_settings(user_id: str, format_: str, my_class: str, my_dec
     )
 
 
-def _insert_match_sync(user_id: str, settings: dict, opp_class: str, is_first: bool, is_win: bool):
+def _register_deck_name(conn, class_name: str, deck_name: str):
+    """デッキ名プールに登録・使用件数を増やす（オートコンプリート候補用）"""
+    if not deck_name:
+        return
+    row = conn.execute(
+        "SELECT id, use_count FROM deck_names "
+        "WHERE class_name = ? AND deck_name = ? AND env_id = ?",
+        (class_name, deck_name, CURRENT_ENV_ID),
+    ).fetchone()
+    if row is None:
+        conn.execute(
+            "INSERT INTO deck_names (class_name, deck_name, use_count, is_official, env_id) "
+            "VALUES (?, ?, 1, 0, ?)",
+            (class_name, deck_name, CURRENT_ENV_ID),
+        )
+    else:
+        conn.execute(
+            "UPDATE deck_names SET use_count = use_count + 1 WHERE id = ?", (row["id"],)
+        )
+
+
+def _insert_match_sync(user_id: str, settings: dict, opp_class: str, opp_deck,
+                       is_first: bool, is_win: bool):
     conn = _connect()
     try:
         now = datetime.now(JST).isoformat()
@@ -273,16 +322,149 @@ def _insert_match_sync(user_id: str, settings: dict, opp_class: str, is_first: b
         """, (
             user_id, now, CURRENT_ENV_ID, settings["format"], settings["my_class"],
             settings.get("my_deck"), settings.get("rank_tier"), settings.get("cr_grade"),
-            opp_class, None, 1 if is_first else 0, 1 if is_win else 0,
+            opp_class, opp_deck, 1 if is_first else 0, 1 if is_win else 0,
         ))
+        # 自分のデッキ・相手のデッキの両方を候補プールに貯める
+        _register_deck_name(conn, settings["my_class"], settings.get("my_deck"))
+        _register_deck_name(conn, opp_class, opp_deck)
         conn.commit()
     finally:
         conn.close()
 
 
-async def insert_match(user_id: str, settings: dict, opp_class: str, is_first: bool, is_win: bool):
-    await asyncio.to_thread(_insert_match_sync, user_id, settings, opp_class, is_first, is_win)
+async def insert_match(user_id: str, settings: dict, opp_class: str, opp_deck,
+                       is_first: bool, is_win: bool):
+    await asyncio.to_thread(
+        _insert_match_sync, user_id, settings, opp_class, opp_deck, is_first, is_win
+    )
     mark_dirty()
+
+
+def _get_deck_names_sync(class_name: str, limit: int = 20):
+    """そのクラスで使われているデッキ名を使用件数の多い順に返す"""
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT deck_name FROM deck_names
+            WHERE class_name = ? AND env_id = ?
+            ORDER BY is_official DESC, use_count DESC, deck_name
+            LIMIT ?
+        """, (class_name, CURRENT_ENV_ID, limit)).fetchall()
+        return [r["deck_name"] for r in rows]
+    finally:
+        conn.close()
+
+
+async def get_deck_names(class_name: str, limit: int = 20):
+    return await asyncio.to_thread(_get_deck_names_sync, class_name, limit)
+
+
+# ---- デッキテンプレート ----
+
+def _add_template_sync(user_id: str, format_: str, my_class: str, deck_name: str) -> bool:
+    conn = _connect()
+    try:
+        now = datetime.now(JST).isoformat()
+        try:
+            conn.execute(
+                "INSERT INTO deck_templates (user_id, format, my_class, deck_name, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, format_, my_class, deck_name, now),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False  # 同じ組み合わせが登録済み
+    finally:
+        conn.close()
+
+
+async def add_template(user_id: str, format_: str, my_class: str, deck_name: str) -> bool:
+    return await asyncio.to_thread(_add_template_sync, user_id, format_, my_class, deck_name)
+
+
+def _list_templates_sync(user_id: str):
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM deck_templates WHERE user_id = ? ORDER BY id", (user_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def list_templates(user_id: str):
+    return await asyncio.to_thread(_list_templates_sync, user_id)
+
+
+def _delete_template_sync(user_id: str, template_id: int) -> bool:
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "DELETE FROM deck_templates WHERE id = ? AND user_id = ?", (template_id, user_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+async def delete_template(user_id: str, template_id: int) -> bool:
+    return await asyncio.to_thread(_delete_template_sync, user_id, template_id)
+
+
+def _apply_template_sync(user_id: str, template_id: int):
+    """テンプレートを現在の設定に反映する。ランク帯・グレードは維持する"""
+    conn = _connect()
+    try:
+        t = conn.execute(
+            "SELECT * FROM deck_templates WHERE id = ? AND user_id = ?", (template_id, user_id)
+        ).fetchone()
+        if t is None:
+            return None
+        cur = conn.execute("SELECT * FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
+        rank_tier = cur["rank_tier"] if cur else None
+        cr_grade = cur["cr_grade"] if cur else None
+        now = datetime.now(JST).isoformat()
+        conn.execute("""
+            INSERT INTO user_settings (user_id, format, my_class, my_deck, rank_tier, cr_grade, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                format = excluded.format,
+                my_class = excluded.my_class,
+                my_deck = excluded.my_deck,
+                updated_at = excluded.updated_at
+        """, (user_id, t["format"], t["my_class"], t["deck_name"], rank_tier, cr_grade, now))
+        conn.commit()
+        return dict(t)
+    finally:
+        conn.close()
+
+
+async def apply_template(user_id: str, template_id: int):
+    return await asyncio.to_thread(_apply_template_sync, user_id, template_id)
+
+
+def _update_rank_sync(user_id: str, rank_tier: str, cr_grade) -> bool:
+    """ランク帯とグレードだけを更新する。デッキ情報は触らない"""
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT user_id FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None:
+            return False  # 先に /戦績設定 が必要
+        conn.execute(
+            "UPDATE user_settings SET rank_tier = ?, cr_grade = ?, updated_at = ? WHERE user_id = ?",
+            (rank_tier, cr_grade, datetime.now(JST).isoformat(), user_id),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+async def update_rank(user_id: str, rank_tier: str, cr_grade) -> bool:
+    return await asyncio.to_thread(_update_rank_sync, user_id, rank_tier, cr_grade)
 
 
 def _delete_last_match_sync(user_id: str):
@@ -361,6 +543,38 @@ async def fetch_all_user_settings():
     return await asyncio.to_thread(_fetch_all_user_settings_sync)
 
 
+# ---- BOTの小さな永続状態（掲示板のチャンネルID・メッセージIDなど） ----
+
+def _get_state_sync(key: str):
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+    finally:
+        conn.close()
+
+
+async def get_state(key: str):
+    return await asyncio.to_thread(_get_state_sync, key)
+
+
+def _set_state_sync(key: str, value: str):
+    conn = _connect()
+    try:
+        conn.execute(
+            "INSERT INTO bot_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def set_state(key: str, value: str):
+    await asyncio.to_thread(_set_state_sync, key, value)
+
+
 def _get_global_summary_sync():
     """現環境の全体集計。クラス別・先後別まで一度に出す"""
     conn = _connect()
@@ -416,9 +630,69 @@ class OpponentClassSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         view: SensekiFlowView = self.view
         view.opp_class = self.values[0]
+        # そのクラスで既に使われているデッキ名を候補に出す
+        known = await get_deck_names(view.opp_class)
+        view.show_opponent_deck(known)
+        await interaction.response.edit_message(
+            content=view.screen(
+                "相手のデッキが分かれば選んでください。分からなければ「分からない」でOKです。"
+            ),
+            view=view,
+        )
+
+
+class OpponentDeckSelect(discord.ui.Select):
+    """既知のデッキ名から選ぶ。候補になければモーダルで新規入力"""
+
+    SKIP_VALUE = "__skip__"
+    NEW_VALUE = "__new__"
+
+    def __init__(self, known_decks: list[str]):
+        options = [
+            discord.SelectOption(label="分からない / 入力しない", value=self.SKIP_VALUE),
+            discord.SelectOption(label="新しく入力する…", value=self.NEW_VALUE),
+        ]
+        # Discordのセレクトは25件が上限。既定の2件を除いた分だけ載せる
+        for name in known_decks[:23]:
+            options.append(discord.SelectOption(label=name[:100], value=name[:100]))
+        super().__init__(
+            placeholder="相手のデッキ（任意）", options=options, min_values=1, max_values=1
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SensekiFlowView = self.view
+        value = self.values[0]
+
+        if value == self.NEW_VALUE:
+            await interaction.response.send_modal(OpponentDeckModal(view))
+            return
+
+        view.opp_deck = None if value == self.SKIP_VALUE else value
         view.show_first_second()
         await interaction.response.edit_message(
-            content=f"相手クラス：**{view.opp_class}**\n先攻／後攻を選んでください。",
+            content=view.screen("先攻／後攻を選んでください。"),
+            view=view,
+        )
+
+
+class OpponentDeckModal(discord.ui.Modal, title="相手のデッキ名を入力"):
+    deck_name = discord.ui.TextInput(
+        label="デッキ名",
+        placeholder="例：進化エルフ",
+        required=True,
+        max_length=50,
+    )
+
+    def __init__(self, flow_view: "SensekiFlowView"):
+        super().__init__()
+        self.flow_view = flow_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        view = self.flow_view
+        view.opp_deck = str(self.deck_name.value).strip() or None
+        view.show_first_second()
+        await interaction.response.edit_message(
+            content=view.screen("先攻／後攻を選んでください。"),
             view=view,
         )
 
@@ -432,7 +706,7 @@ class FirstButton(discord.ui.Button):
         view.is_first = True
         view.show_win_lose()
         await interaction.response.edit_message(
-            content=f"相手クラス：**{view.opp_class}** / **先攻**\n結果を選んでください。",
+            content=view.screen("結果を選んでください。"),
             view=view,
         )
 
@@ -446,7 +720,7 @@ class SecondButton(discord.ui.Button):
         view.is_first = False
         view.show_win_lose()
         await interaction.response.edit_message(
-            content=f"相手クラス：**{view.opp_class}** / **後攻**\n結果を選んでください。",
+            content=view.screen("結果を選んでください。"),
             view=view,
         )
 
@@ -477,7 +751,7 @@ class RepeatButton(discord.ui.Button):
         view: SensekiFlowView = self.view
         view.reset()
         await interaction.response.edit_message(
-            content="相手クラスを選択してください。",
+            content=view.screen("相手クラスを選択してください。"),
             view=view,
         )
 
@@ -488,9 +762,47 @@ class SensekiFlowView(discord.ui.View):
         self.user_id = user_id
         self.settings = settings
         self.opp_class = None
+        self.opp_deck = None
         self.is_first = None
         self.clear_items()
         self.add_item(OpponentClassSelect())
+
+    def describe_settings(self) -> str:
+        """今の自分の設定。全ステップで出し続けて、古いまま記録するのを防ぐ"""
+        s = self.settings
+        fmt = FORMAT_LABELS.get(s["format"], s["format"])
+        deck = s.get("my_deck") or "デッキ未設定"
+        rank = s.get("rank_tier") or "ランク未設定"
+        if s.get("cr_grade"):
+            rank += f"・{s['cr_grade']}"
+        elif s.get("rank_tier") == GRAND_MASTER_TIER:
+            rank += "・グレードなし"
+        return f"🧑 あなた：**{deck}**（{s['my_class']} / {fmt}） / ランク：**{rank}**"
+
+    def screen(self, body: str) -> str:
+        """設定ヘッダー＋進捗＋操作案内をまとめた画面テキスト"""
+        parts = [self.describe_settings()]
+        progress = self.describe_progress()
+        if progress:
+            parts.append(progress)
+        parts.append("")
+        parts.append(body)
+        return "\n".join(parts)
+
+    def describe_progress(self) -> str:
+        """ここまでに選んだ内容を1行で"""
+        if self.opp_class is None:
+            return ""
+        label = f"🆚 相手：**{self.opp_class}**"
+        if self.opp_deck:
+            label += f"（{self.opp_deck}）"
+        if self.is_first is not None:
+            label += f" / **{'先攻' if self.is_first else '後攻'}**"
+        return label
+
+    def show_opponent_deck(self, known_decks: list[str]):
+        self.clear_items()
+        self.add_item(OpponentDeckSelect(known_decks))
 
     def show_first_second(self):
         self.clear_items()
@@ -504,20 +816,22 @@ class SensekiFlowView(discord.ui.View):
 
     def reset(self):
         self.opp_class = None
+        self.opp_deck = None
         self.is_first = None
         self.clear_items()
         self.add_item(OpponentClassSelect())
 
     async def finalize(self, interaction: discord.Interaction, is_win: bool):
-        await insert_match(self.user_id, self.settings, self.opp_class, self.is_first, is_win)
+        await insert_match(
+            self.user_id, self.settings, self.opp_class, self.opp_deck,
+            self.is_first, is_win,
+        )
         result_label = "勝ち" if is_win else "負け"
-        first_label = "先攻" if self.is_first else "後攻"
         self.clear_items()
         self.add_item(RepeatButton())
         await interaction.response.edit_message(
-            content=(
-                f"✅ 記録しました\n"
-                f"相手クラス：**{self.opp_class}** / {first_label} / **{result_label}**\n\n"
+            content=self.screen(
+                f"✅ **{result_label}** で記録しました。\n"
                 f"続けて記録する場合は下のボタンを押してください。"
             ),
             view=self,
@@ -526,6 +840,91 @@ class SensekiFlowView(discord.ui.View):
     async def on_timeout(self):
         # メッセージ編集はできないため何もしない（ephemeralなので放置で問題なし）
         pass
+
+
+def _resolve_grade(rank_value: str, raw_grade):
+    """
+    ランク帯とグレードの整合を取る。
+    戻り値: (保存するグレード, 補足メッセージ, エラーメッセージ)
+
+    グランドマスターはグレード指定を必須にするが、「グレードなし」も
+    正規の選択肢として認める（昇格直後はCRが1650に届かないため）。
+    """
+    if rank_value == GRAND_MASTER_TIER:
+        if raw_grade is None:
+            return None, None, (
+                f"{GRAND_MASTER_TIER}を選んだ場合は `グレード` も指定してください。\n"
+                f"CRが1650未満でグレードが付いていない場合は"
+                f"「{CR_GRADE_NONE_LABEL}」を選んでください。"
+            )
+        if raw_grade == CR_GRADE_NONE_VALUE:
+            return None, None, None
+        return raw_grade, None, None
+
+    # グランドマスター以外にCRは存在しない
+    if raw_grade is not None and raw_grade != CR_GRADE_NONE_VALUE:
+        return None, (
+            f"※グレードは{GRAND_MASTER_TIER}帯でのみ記録されるため、今回は保存していません。"
+        ), None
+    return None, None, None
+
+
+# ==============================
+# /デッキ切替 のUI
+# ==============================
+
+def _template_label(t: dict) -> str:
+    fmt = "ロテ" if t["format"] == "rotation" else "アンリミ"
+    return f"{t['deck_name']}（{t['my_class']} / {fmt}）"
+
+
+class TemplateSelect(discord.ui.Select):
+    def __init__(self, templates: list[dict], mode: str):
+        self.mode = mode  # "switch" or "delete"
+        options = [
+            discord.SelectOption(label=_template_label(t)[:100], value=str(t["id"]))
+            for t in templates[:25]
+        ]
+        placeholder = "使うデッキを選択" if mode == "switch" else "削除するデッキを選択"
+        super().__init__(placeholder=placeholder, options=options, min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = str(interaction.user.id)
+        template_id = int(self.values[0])
+
+        if self.mode == "delete":
+            ok = await delete_template(user_id, template_id)
+            msg = "🗑️ 削除しました。" if ok else "削除できませんでした。"
+            await interaction.response.edit_message(content=msg, view=None)
+            return
+
+        t = await apply_template(user_id, template_id)
+        if t is None:
+            await interaction.response.edit_message(
+                content="そのデッキが見つかりませんでした。", view=None
+            )
+            return
+        settings = await get_user_settings(user_id)
+        rank = settings.get("rank_tier") or "未設定"
+        if settings.get("cr_grade"):
+            rank += f"（{settings['cr_grade']}）"
+        await interaction.response.edit_message(
+            content=(
+                f"✅ デッキを切り替えました\n"
+                f"{_template_label(t)}\n"
+                f"ランク帯：{rank}（変更していません）"
+            ),
+            view=None,
+        )
+        cog = interaction.client.get_cog("SensekiCog")
+        if cog is not None:
+            await cog._update_board()
+
+
+class TemplateView(discord.ui.View):
+    def __init__(self, templates: list[dict], mode: str = "switch"):
+        super().__init__(timeout=180)
+        self.add_item(TemplateSelect(templates, mode))
 
 
 # ==============================
@@ -550,7 +949,7 @@ def build_workbook(matches: list[dict], guild) -> bytes:
     ws_raw.append([
         "記録日時", "ユーザー", "ユーザーID", "環境ID", "フォーマット",
         "自分のクラス", "自分のデッキ", "ランク帯", "グレード",
-        "相手クラス", "先攻/後攻", "勝敗",
+        "相手クラス", "相手デッキ", "先攻/後攻", "勝敗",
     ])
     for m in matches:
         ws_raw.append([
@@ -564,6 +963,7 @@ def build_workbook(matches: list[dict], guild) -> bytes:
             m.get("rank_tier") or "",
             m.get("cr_grade") or "",
             m["opp_class"],
+            m.get("opp_deck") or "",
             "先攻" if m["is_first"] else "後攻",
             "勝ち" if m["is_win"] else "負け",
         ])
@@ -609,11 +1009,95 @@ class SensekiCog(commands.Cog):
             self.daily_sheets_sync.start()
         if not self.debounced_sheets_sync.is_running():
             self.debounced_sheets_sync.start()
+        # BOT再起動をまたいでも掲示板が最新になるよう一度更新しておく
+        try:
+            await self._update_board()
+        except Exception as e:
+            print(f"⚠️ 起動時の戦績掲示板更新に失敗しました: {type(e).__name__}: {e}")
 
     def cog_unload(self):
         self.weekly_export.cancel()
         self.daily_sheets_sync.cancel()
         self.debounced_sheets_sync.cancel()
+
+    # ---- 現状掲示板（全プレイヤーのデッキ＆ランク一覧） ----
+
+    BOARD_CHANNEL_KEY = "board_channel_id"
+    BOARD_MESSAGE_KEY = "board_message_id"
+
+    async def _build_board_embed(self) -> discord.Embed:
+        all_settings = await fetch_all_user_settings()
+        guild = self.bot.get_guild(GUILD_ID)
+        resolve = self._name_resolver()
+
+        by_class: dict[str, list[str]] = {}
+        for uid, s in all_settings.items():
+            deck = s.get("my_deck") or "デッキ未設定"
+            rank = s.get("rank_tier") or "ランク未設定"
+            if s.get("cr_grade"):
+                rank += f"・{s['cr_grade']}"
+            elif s.get("rank_tier") == GRAND_MASTER_TIER:
+                rank += "・グレードなし"
+            line = f"・{resolve(uid)}：{deck}（{rank}）"
+            by_class.setdefault(s["my_class"], []).append(line)
+
+        embed = discord.Embed(
+            title="📋 現在の使用デッキ＆ランク",
+            description="`/戦績設定` `/デッキ切替` `/ランク更新` のいずれかを実行すると自動で更新されます。",
+            color=0x2E6DA4,
+        )
+        if not by_class:
+            embed.add_field(name="―", value="まだ誰も設定していません。", inline=False)
+        else:
+            for cls in CLASS_CHOICES:
+                if cls in by_class:
+                    value = "\n".join(by_class[cls])[:1024]
+                    embed.add_field(name=f"【{cls}】", value=value, inline=False)
+        embed.timestamp = datetime.now(JST)
+        return embed
+
+    async def _update_board(self):
+        """設定変更のたびに呼ぶ。掲示板が未設置なら何もしない"""
+        channel_id = await get_state(self.BOARD_CHANNEL_KEY)
+        message_id = await get_state(self.BOARD_MESSAGE_KEY)
+        if not channel_id or not message_id:
+            return
+
+        channel = self.bot.get_channel(int(channel_id))
+        if channel is None:
+            print(f"⚠️ 戦績掲示板のチャンネルが見つかりません（ID: {channel_id}）")
+            return
+
+        try:
+            message = await channel.fetch_message(int(message_id))
+            embed = await self._build_board_embed()
+            await message.edit(embed=embed)
+        except discord.NotFound:
+            print("⚠️ 戦績掲示板のメッセージが見つかりません。`/戦績板設置` をやり直してください。")
+        except discord.Forbidden:
+            print("⚠️ 戦績掲示板を編集する権限がありません。")
+        except Exception as e:
+            print(f"⚠️ 戦績掲示板の更新に失敗しました: {type(e).__name__}: {e}")
+
+    @app_commands.command(
+        name="戦績板設置",
+        description="このチャンネルに、全員の使用デッキ＆ランクを常時表示する掲示板を作ります（管理者専用）",
+    )
+    @app_commands.default_permissions(administrator=True)
+    async def senseki_board_setup(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        embed = await self._build_board_embed()
+        message = await interaction.channel.send(embed=embed)
+        try:
+            await message.pin()
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "掲示板は作成しましたが、ピン留めの権限がなかったため手動で留めてください。",
+                ephemeral=True,
+            )
+        await set_state(self.BOARD_CHANNEL_KEY, str(interaction.channel.id))
+        await set_state(self.BOARD_MESSAGE_KEY, str(message.id))
+        await interaction.followup.send("✅ 掲示板を設置しました。", ephemeral=True)
 
     # ---- Googleスプレッドシート同期 ----
 
@@ -846,14 +1330,116 @@ class SensekiCog(commands.Cog):
         )
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
+    # ---- /デッキ登録 ----
+    @app_commands.command(name="デッキ登録", description="よく使うデッキを登録しておきます（複数登録できます）")
+    @app_commands.describe(
+        フォーマット="このデッキで遊ぶフォーマット",
+        クラス="このデッキのクラス",
+        デッキ名="デッキ名（例：進化ネメシス）",
+    )
+    @app_commands.choices(フォーマット=[
+        app_commands.Choice(name="ローテーション", value="rotation"),
+        app_commands.Choice(name="アンリミテッド", value="unlimited"),
+    ])
+    @app_commands.choices(クラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES])
+    async def deck_register(
+        self,
+        interaction: discord.Interaction,
+        フォーマット: app_commands.Choice[str],
+        クラス: app_commands.Choice[str],
+        デッキ名: str,
+    ):
+        name = (デッキ名 or "").strip()
+        if not name:
+            await interaction.response.send_message("デッキ名を入力してください。", ephemeral=True)
+            return
+
+        ok = await add_template(
+            str(interaction.user.id), フォーマット.value, クラス.value, name
+        )
+        if not ok:
+            await interaction.response.send_message(
+                "同じ組み合わせのデッキがすでに登録されています。", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            f"✅ 登録しました\n{name}（{クラス.name} / {フォーマット.name}）\n\n"
+            "`/デッキ切替` で選ぶだけで使うデッキを変更できます。",
+            ephemeral=True,
+        )
+
+    # ---- /デッキ切替 ----
+    @app_commands.command(name="デッキ切替", description="登録済みのデッキから、今使うデッキを選びます")
+    @app_commands.describe(削除="オンにすると、選んだデッキを登録から削除します")
+    async def deck_switch(self, interaction: discord.Interaction, 削除: bool = False):
+        templates = await list_templates(str(interaction.user.id))
+        if not templates:
+            await interaction.response.send_message(
+                "登録済みのデッキがありません。`/デッキ登録` で登録してください。",
+                ephemeral=True,
+            )
+            return
+
+        settings = await get_user_settings(str(interaction.user.id))
+        if settings is None and not 削除:
+            await interaction.response.send_message(
+                "先に `/戦績設定` でランク帯まで登録してください。", ephemeral=True
+            )
+            return
+
+        mode = "delete" if 削除 else "switch"
+        header = "削除するデッキを選んでください。" if 削除 else "使うデッキを選んでください。"
+        await interaction.response.send_message(
+            header, view=TemplateView(templates, mode), ephemeral=True
+        )
+
+    # ---- /ランク更新 ----
+    @app_commands.command(name="ランク更新", description="ランク帯とグレードだけを変更します（デッキ設定はそのまま）")
+    @app_commands.describe(
+        ランク帯="現在のランク帯",
+        グレード="グランドマスターの方のみ必須。グレードが付いていない場合は「グレードなし」を選択",
+    )
+    @app_commands.choices(ランク帯=[app_commands.Choice(name=r, value=r) for r in RANK_TIER_CHOICES])
+    @app_commands.choices(グレード=(
+        [app_commands.Choice(name=CR_GRADE_NONE_LABEL, value=CR_GRADE_NONE_VALUE)]
+        + [app_commands.Choice(name=g, value=g) for g in CR_GRADE_CHOICES]
+    ))
+    async def rank_update(
+        self,
+        interaction: discord.Interaction,
+        ランク帯: app_commands.Choice[str],
+        グレード: app_commands.Choice[str] = None,
+    ):
+        rank_value = ランク帯.value
+        raw_grade = グレード.value if グレード else None
+
+        grade_value, note, error = _resolve_grade(rank_value, raw_grade)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
+
+        ok = await update_rank(str(interaction.user.id), rank_value, grade_value)
+        if not ok:
+            await interaction.response.send_message(
+                "先に `/戦績設定` で初期設定をしてください。", ephemeral=True
+            )
+            return
+
+        label = f"{rank_value}（{grade_value}）" if grade_value else rank_value
+        lines = [f"✅ ランク帯を更新しました：{label}"]
+        if note:
+            lines.append(note)
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await self._update_board()
+
     # ---- /戦績設定 ----
     @app_commands.command(name="戦績設定", description="フォーマット・自分のクラス・デッキタイプ・ランク帯を登録します")
     @app_commands.describe(
         フォーマット="使用するフォーマット",
         クラス="自分の使用クラス",
-        デッキタイプ="任意：デッキ名（例：進化ネメシス）。分かる範囲で入力してください",
-        ランク帯="任意：現在のランク帯",
-        グレード="任意：グランドマスターの方のみ。CRのグレードを選択してください",
+        デッキタイプ="デッキ名（例：進化ネメシス）",
+        ランク帯="現在のランク帯",
+        グレード="グランドマスターの方のみ必須。CRのグレードを選択してください",
     )
     @app_commands.choices(フォーマット=[
         app_commands.Choice(name="ローテーション", value="rotation"),
@@ -861,48 +1447,57 @@ class SensekiCog(commands.Cog):
     ])
     @app_commands.choices(クラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES])
     @app_commands.choices(ランク帯=[app_commands.Choice(name=r, value=r) for r in RANK_TIER_CHOICES])
-    @app_commands.choices(グレード=[app_commands.Choice(name=g, value=g) for g in CR_GRADE_CHOICES])
+    @app_commands.choices(グレード=(
+        [app_commands.Choice(name=CR_GRADE_NONE_LABEL, value=CR_GRADE_NONE_VALUE)]
+        + [app_commands.Choice(name=g, value=g) for g in CR_GRADE_CHOICES]
+    ))
     async def senseki_settings(
         self,
         interaction: discord.Interaction,
         フォーマット: app_commands.Choice[str],
         クラス: app_commands.Choice[str],
-        デッキタイプ: str = None,
-        ランク帯: app_commands.Choice[str] = None,
+        デッキタイプ: str,
+        ランク帯: app_commands.Choice[str],
         グレード: app_commands.Choice[str] = None,
     ):
-        rank_value = ランク帯.value if ランク帯 else None
-        grade_value = グレード.value if グレード else None
+        rank_value = ランク帯.value
+        raw_grade = グレード.value if グレード else None
+        deck_value = (デッキタイプ or "").strip()
 
-        # CRはグランドマスター帯でのみ発生するため、それ以外では保存しない
-        note = None
-        if grade_value and rank_value != GRAND_MASTER_TIER:
-            grade_value = None
-            note = (
-                f"※グレードは{GRAND_MASTER_TIER}帯でのみ記録されるため、今回は保存していません。"
+        # 空白だけの入力を弾く
+        if not deck_value:
+            await interaction.response.send_message(
+                "デッキタイプを入力してください。", ephemeral=True
             )
+            return
+
+        grade_value, note, error = _resolve_grade(rank_value, raw_grade)
+        if error:
+            await interaction.response.send_message(error, ephemeral=True)
+            return
 
         await upsert_user_settings(
             str(interaction.user.id), フォーマット.value, クラス.value,
-            デッキタイプ, rank_value, grade_value,
+            deck_value, rank_value, grade_value,
         )
+        # ここで指定したデッキはテンプレートにも入れておく（次回から選ぶだけで済む）
+        await add_template(
+            str(interaction.user.id), フォーマット.value, クラス.value, deck_value
+        )
+        rank_label = f"{rank_value}（{grade_value}）" if grade_value else rank_value
         lines = [
             "✅ 設定を保存しました",
             f"フォーマット：{フォーマット.name}",
             f"クラス：{クラス.name}",
+            f"デッキタイプ：{deck_value}",
+            f"ランク帯：{rank_label}",
         ]
-        if デッキタイプ:
-            lines.append(f"デッキタイプ：{デッキタイプ}")
-        if rank_value:
-            if grade_value:
-                lines.append(f"ランク帯：{rank_value}（{grade_value}）")
-            else:
-                lines.append(f"ランク帯：{rank_value}")
         if note:
             lines.append(note)
         lines.append("\n`/戦績` で記録できます。相手クラス・先後・勝敗だけ入力すればOKです。")
-        lines.append("ランクが変わったら `/戦績設定` をもう一度実行してください。")
+        lines.append("ランクが変わったら `/ランク更新`、デッキを変えるときは `/デッキ切替` が早いです。")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await self._update_board()
 
     # ---- /戦績 ----
     @app_commands.command(name="戦績", description="対戦結果を記録します")
@@ -915,10 +1510,12 @@ class SensekiCog(commands.Cog):
             )
             return
 
-        format_label = FORMAT_LABELS.get(settings["format"], settings["format"])
         view = SensekiFlowView(str(interaction.user.id), settings)
         await interaction.response.send_message(
-            f"現在の設定：{format_label} / {settings['my_class']}\n\n相手クラスを選択してください。",
+            view.screen(
+                "相手クラスを選択してください。\n"
+                "-# 上の内容が違う場合は `/デッキ切替` `/ランク更新` で変更してください。"
+            ),
             view=view,
             ephemeral=True,
         )
