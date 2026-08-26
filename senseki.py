@@ -1792,7 +1792,7 @@ class SensekiCog(commands.Cog):
     @app_commands.command(name="攻略記事登録", description="対面ごとのおすすめ攻略記事を登録します（管理者専用）")
     @app_commands.describe(
         相手クラス="この相手クラスへの対策記事",
-        URL="記事のURL",
+        url="記事のURL",
         自分のクラス="任意：自分のクラスを指定すると、その組み合わせでのみ表示されます（省略時は相手クラス共通の記事）",
         メモ="任意：一言コメント",
     )
@@ -1803,14 +1803,14 @@ class SensekiCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         相手クラス: app_commands.Choice[str],
-        URL: str,
+        url: str,
         自分のクラス: app_commands.Choice[str] = None,
         メモ: str = None,
     ):
         my_class = 自分のクラス.value if 自分のクラス else ""
-        await upsert_guide_link(my_class, 相手クラス.value, URL, メモ)
+        await upsert_guide_link(my_class, 相手クラス.value, url, メモ)
         scope = f"{自分のクラス.name} vs {相手クラス.name}" if 自分のクラス else f"vs {相手クラス.name}（汎用）"
-        await interaction.response.send_message(f"✅ 登録しました：{scope}\n{URL}", ephemeral=True)
+        await interaction.response.send_message(f"✅ 登録しました：{scope}\n{url}", ephemeral=True)
 
     @app_commands.command(name="攻略記事一覧", description="登録済みの攻略記事を一覧表示します（管理者専用）")
     @app_commands.default_permissions(administrator=True)
