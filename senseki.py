@@ -5,32 +5,40 @@ senseki.py
 詳細仕様は `戦績ツール_実装仕様書.md` を参照。
 このファイルはフェーズ1のみを実装しています。
 
-フェーズ1で実装する範囲
-  1. SQLiteのテーブル作成（matches / user_settings / deck_names）
-  2. /戦績設定（全項目必須）／ /デッキ登録・/デッキ切替・/ランク更新
-  3. /戦績（ボタン形式のみ）
-  4. /戦績取消
-  5. /戦績確認（自分の勝率のみ。クラス別・対面別の内訳はフェーズ2）
-  6. /戦績データ抽出（管理者専用）：生データ＋ユーザー別集計をExcel（xlsx）で出力
-     毎週月曜9:00（JST）に現環境分を管理者DMへ自動送信もする
-  7. /戦績全体（管理者専用）：その瞬間のDBから全体集計を出す
-     クラス別・対面別・先後別。シートを見なくてもDiscord上で完結する
-  8. /戦績シート同期・/戦績シート診断（管理者専用）：Googleスプレッドシートへ同期
-     記録・取消があると SHEETS_DEBOUNCE_SECONDS 後にまとめて自動反映。
-     加えて毎日9:30（JST）にも同期する（環境変数が未設定なら何もしない）
-     詳細は senseki_sheets.py を参照
-  9. /戦績板設置（管理者専用）：全員の使用デッキ＆ランクを1メッセージに
-     常時表示する掲示板を作る。/戦績設定・/デッキ切替・/ランク更新の
-     どれかが実行されるたびに自動で書き換わる（新規投稿ではなく編集）
-  10. /弱点対面：自分の対面別勝率の低い相手を抽出し、
-      登録済みの攻略記事があれば一緒に表示する（3戦以上・参考値扱い）
-      現状は誰でも使える。切り替え方法は下記「有料化スイッチ」を参照
-  11. /攻略記事登録・/攻略記事一覧・/攻略記事削除（管理者専用）：
-      対面ごとのおすすめ記事URLを管理する
+コマンド構成（Discord上のトップレベルは3つだけ）
 
-  12. /戦績パネル設置（管理者専用）：チャンネルに「戦績を記録する」ボタンを
-      1つ常設する。押した人にだけ /戦績 と同じ入力画面が開く（永続ビュー、
-      custom_id固定でBOT再起動後も動作し続ける）
+  /戦績
+    記録        対戦結果を記録（ボタン形式）
+    取消        直前の1件を取り消し
+    確認        今のデッキ・ランクと自分の勝率
+    設定        フォーマット・クラス・デッキ・ランクを登録（全項目必須）
+    ランク更新   ランク帯とグレードだけ変更（デッキは維持）
+    弱点対面     勝率の低い対面と、おすすめ攻略記事
+
+  /デッキ
+    登録        よく使うデッキを登録（複数可）
+    切替        登録済みから選んで切替（ランクは維持）
+
+  /戦績管理（管理者のみ表示）
+    パネル設置    記録・切替・ランク更新・取消の4ボタンを常設
+    掲示板設置    全員の使用デッキ＆ランクの一覧を常設（設定変更時に自動更新）
+    全体集計      その瞬間のDBから全体・先後別・クラス別・対面別を表示
+    データ抽出    生データ＋集計のExcelを出力（毎週月曜9:00にDMへ自動送信）
+    シート同期    Googleスプレッドシートへ即時同期
+    シート診断    スプレッドシート連携の設定状況
+    診断          DBの保存先と永続化状況（データが消える事故の確認用）
+    記事登録／記事一覧／記事削除  対面ごとのおすすめ記事URLの管理
+
+【データの保存先について】
+  Railwayの永続ボリュームのマウント先はプロジェクトによって異なる
+  （/data のことも /app/data のこともある）。間違った場所に書くと
+  書き込み自体は成功するのに再デプロイで消えるため、気づきにくい。
+  そのため _resolve_db_path() が
+    1. 環境変数 SENSEKI_DB_PATH（最優先）
+    2. すでにDBファイルが存在する場所
+    3. マウント済み（＝永続）のディレクトリ
+  の順に探す。起動のたびに保存先と永続化状況をログへ出し、
+  永続でなければ警告を出す。/戦績管理 診断 でも同じ情報を確認できる。
 
 【有料化スイッチについて（/弱点対面 の公開範囲）】
   現状は誰でも使える。有料化のタイミングで Railway の環境変数に
@@ -49,10 +57,10 @@ senseki.py
 
 main.py への統合方法は末尾のコメントを参照。
 
-【デプロイ前に必ず確認すること】
-Railway の shirokusa-bot サービスに永続ボリューム（マウントパス /data）が
-設定されているか確認してください。未設定のままデプロイすると、
-再デプロイのたびに戦績データが消えます。
+【デプロイ後に必ず確認すること】
+Railwayのログに出る「戦績ツール ストレージ診断」を見て、
+「永続ボリュームか: はい」になっていることを確認してください。
+「いいえ」の場合は再デプロイでデータが消えます。
 """
 
 import asyncio
@@ -85,8 +93,73 @@ except Exception as _e:  # モジュール未配置でも起動を止めない
 
 GUILD_ID = 1194515135071539210
 
-# Railway永続ボリューム（/data）に置く。飯テロBOTと同じ方式。
-DB_PATH = os.environ.get("SENSEKI_DB_PATH", "/data/senseki.db")
+# ---- DBの置き場所 ----
+# Railwayの永続ボリュームはプロジェクトによってマウント先が違う。
+# /data のこともあれば /app/data のこともあり、間違えると再デプロイのたびに
+# データが消える（書き込みは成功するので気づきにくい）。
+# そのため「明示指定 → 既存DBのある場所 → マウント済みの場所」の順で探す。
+
+DB_FILENAME = "senseki.db"
+
+# 探索候補。左が優先。
+DB_CANDIDATE_DIRS = ["/data", "/app/data"]
+
+
+def _is_persistent(path: str) -> bool:
+    """そのディレクトリが永続ボリュームとしてマウントされているか"""
+    try:
+        return os.path.ismount(path)
+    except Exception:
+        return False
+
+
+def _resolve_db_path() -> str:
+    # 1. 環境変数で明示指定されていればそれに従う（最優先）
+    explicit = os.environ.get("SENSEKI_DB_PATH")
+    if explicit:
+        return explicit
+
+    # 2. すでにDBファイルが存在する場所があればそこを使う（データを見失わない）
+    for d in DB_CANDIDATE_DIRS:
+        candidate = os.path.join(d, DB_FILENAME)
+        if os.path.exists(candidate):
+            return candidate
+
+    # 3. マウント済み（＝永続化される）ディレクトリを優先して新規作成
+    for d in DB_CANDIDATE_DIRS:
+        if _is_persistent(d):
+            return os.path.join(d, DB_FILENAME)
+
+    # 4. どれも該当しなければ既定値。永続化されない可能性があるため起動時に警告する
+    return os.path.join(DB_CANDIDATE_DIRS[0], DB_FILENAME)
+
+
+DB_PATH = _resolve_db_path()
+
+
+def describe_storage() -> str:
+    """DBの保存先と永続化状況を人間が読める形で返す（診断用）"""
+    lines = [f"DBパス: {DB_PATH}"]
+    directory = os.path.dirname(DB_PATH)
+    mounted = _is_persistent(directory)
+    lines.append(f"保存先ディレクトリ: {directory}")
+    lines.append(f"永続ボリュームか: {'はい' if mounted else '❌ いいえ（再デプロイで消えます）'}")
+
+    if os.path.exists(DB_PATH):
+        size = os.path.getsize(DB_PATH)
+        lines.append(f"DBファイル: あり（{size:,} バイト）")
+    else:
+        lines.append("DBファイル: まだありません（初回起動時は正常）")
+
+    lines.append("")
+    lines.append("候補ディレクトリの状況:")
+    for d in DB_CANDIDATE_DIRS:
+        exists = os.path.isdir(d)
+        mark = "マウント済み" if _is_persistent(d) else ("存在するが非マウント" if exists else "存在しない")
+        has_db = "／DBあり" if os.path.exists(os.path.join(d, DB_FILENAME)) else ""
+        lines.append(f"  {d}: {mark}{has_db}")
+    return "\n".join(lines)
+
 
 JST = timezone(timedelta(hours=9))
 
@@ -619,6 +692,20 @@ def _get_state_sync(key: str):
         conn.close()
 
 
+def _get_record_counts_sync():
+    conn = _connect()
+    try:
+        m = conn.execute("SELECT COUNT(*) AS c FROM matches").fetchone()["c"]
+        u = conn.execute("SELECT COUNT(*) AS c FROM user_settings").fetchone()["c"]
+        return {"matches": m, "users": u}
+    finally:
+        conn.close()
+
+
+async def get_record_counts():
+    return await asyncio.to_thread(_get_record_counts_sync)
+
+
 async def get_state(key: str):
     return await asyncio.to_thread(_get_state_sync, key)
 
@@ -1129,13 +1216,13 @@ class PanelDeckSwitchButton(discord.ui.Button):
         settings = await get_user_settings(user_id)
         if settings is None:
             await interaction.response.send_message(
-                "先に `/戦績設定` で初期設定をしてください。", ephemeral=True
+                "先に `/戦績 設定` で初期設定をしてください。", ephemeral=True
             )
             return
         templates = await list_templates(user_id)
         if not templates:
             await interaction.response.send_message(
-                "登録済みのデッキがありません。`/デッキ登録` で登録してください。",
+                "登録済みのデッキがありません。`/デッキ 登録` で登録してください。",
                 ephemeral=True,
             )
             return
@@ -1168,7 +1255,7 @@ class PanelRankTierSelect(discord.ui.Select):
         ok = await update_rank(str(interaction.user.id), rank_value, None)
         if not ok:
             await interaction.response.edit_message(
-                content="先に `/戦績設定` で初期設定をしてください。", view=None
+                content="先に `/戦績 設定` で初期設定をしてください。", view=None
             )
             return
         await interaction.response.edit_message(
@@ -1195,7 +1282,7 @@ class PanelGradeSelect(discord.ui.Select):
         ok = await update_rank(str(interaction.user.id), self.rank_value, grade_value)
         if not ok:
             await interaction.response.edit_message(
-                content="先に `/戦績設定` で初期設定をしてください。", view=None
+                content="先に `/戦績 設定` で初期設定をしてください。", view=None
             )
             return
         label = f"{self.rank_value}（{grade_value}）" if grade_value else f"{self.rank_value}・グレードなし"
@@ -1220,7 +1307,7 @@ class PanelRankUpdateButton(discord.ui.Button):
         settings = await get_user_settings(str(interaction.user.id))
         if settings is None:
             await interaction.response.send_message(
-                "先に `/戦績設定` で初期設定をしてください。", ephemeral=True
+                "先に `/戦績 設定` で初期設定をしてください。", ephemeral=True
             )
             return
         view = discord.ui.View(timeout=180)
@@ -1335,11 +1422,40 @@ def build_workbook(matches: list[dict], guild) -> bytes:
 # ==============================
 
 class SensekiCog(commands.Cog):
+    # コマンドはグループにまとめている。Discord上は
+    #   /戦績 記録 ／ /戦績 設定 …
+    # のように表示され、トップレベルのコマンド数は3つで済む。
+    senseki = app_commands.Group(
+        name="戦績", description="戦績の記録・確認・設定"
+    )
+    deck = app_commands.Group(
+        name="デッキ", description="使用デッキの登録・切替"
+    )
+    admin = app_commands.Group(
+        name="戦績管理",
+        description="戦績ツールの管理機能（管理者専用）",
+        default_permissions=discord.Permissions(administrator=True),
+    )
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
     async def cog_load(self):
         await init_db()
+
+        # データが消える事故を早期に発見するため、起動のたびに保存先を明示する
+        print("---- 戦績ツール ストレージ診断 ----")
+        print(describe_storage())
+        try:
+            counts = await get_record_counts()
+            print(f"記録件数: {counts['matches']}件 / 設定済みユーザー: {counts['users']}名")
+        except Exception as e:
+            print(f"件数取得に失敗: {type(e).__name__}: {e}")
+        if not _is_persistent(os.path.dirname(DB_PATH)):
+            print("⚠️ 保存先が永続ボリュームではありません。再デプロイでデータが消えます。")
+            print("⚠️ Railway の Volumes でマウント先を確認し、必要なら")
+            print("⚠️ 環境変数 SENSEKI_DB_PATH に正しいパスを設定してください。")
+        print("-----------------------------------")
         if not self.weekly_export.is_running():
             self.weekly_export.start()
         if not self.daily_sheets_sync.is_running():
@@ -1360,11 +1476,7 @@ class SensekiCog(commands.Cog):
         self.daily_sheets_sync.cancel()
         self.debounced_sheets_sync.cancel()
 
-    @app_commands.command(
-        name="戦績パネル設置",
-        description="このチャンネルに「戦績を記録する」ボタンを常設します（管理者専用）",
-    )
-    @app_commands.default_permissions(administrator=True)
+    @admin.command(name="パネル設置", description="このチャンネルに戦績記録パネルを常設します")
     async def senseki_panel_setup(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         message = await interaction.channel.send(
@@ -1375,7 +1487,20 @@ class SensekiCog(commands.Cog):
                 "・🔄 デッキ切替\n"
                 "・📈 ランク更新\n"
                 "・↩️ 直前の記録を取消\n"
-                "-# 初回は `/戦績設定` で先にデッキ・ランクを登録してください。"
+                "\n"
+                "**⚠️ 記録の前に確認してください**\n"
+                "記録画面の上部に、今のあなたのデッキとランクが表示されます。\n"
+                "**違っていたら「🔄 デッキ切替」「📈 ランク更新」で直してから記録してください。**\n"
+                "古い設定のまま記録すると、そのデータは集計に使えなくなります。\n"
+                "間違えたときは「↩️ 直前の記録を取消」で消せます。\n"
+                "\n"
+                "**📋 データの取り扱いについて**\n"
+                "記録された戦績は、全体の統計として集計されます。\n"
+                "・個人の成績が名前つきで公開されることはありません\n"
+                "・「このデッキの全体勝率は○%」といった形で使われます\n"
+                "・集計結果は攻略記事や動画の材料になります\n"
+                "・掲示板に出るのは使用デッキとランク帯のみで、勝敗や勝率は出ません\n"
+                "-# 初回は `/戦績 設定` で先にデッキ・ランクを登録してください。"
             ),
             view=SensekiPanelView(),
         )
@@ -1411,7 +1536,7 @@ class SensekiCog(commands.Cog):
 
         embed = discord.Embed(
             title="📋 現在の使用デッキ＆ランク",
-            description="`/戦績設定` `/デッキ切替` `/ランク更新` のいずれかを実行すると自動で更新されます。",
+            description="`/戦績 設定` `/デッキ 切替` `/戦績 ランク更新` のいずれかを実行すると自動で更新されます。",
             color=0x2E6DA4,
         )
         if not by_class:
@@ -1441,17 +1566,13 @@ class SensekiCog(commands.Cog):
             embed = await self._build_board_embed()
             await message.edit(embed=embed)
         except discord.NotFound:
-            print("⚠️ 戦績掲示板のメッセージが見つかりません。`/戦績板設置` をやり直してください。")
+            print("⚠️ 戦績掲示板のメッセージが見つかりません。`/戦績管理 掲示板設置` をやり直してください。")
         except discord.Forbidden:
             print("⚠️ 戦績掲示板を編集する権限がありません。")
         except Exception as e:
             print(f"⚠️ 戦績掲示板の更新に失敗しました: {type(e).__name__}: {e}")
 
-    @app_commands.command(
-        name="戦績板設置",
-        description="このチャンネルに、全員の使用デッキ＆ランクを常時表示する掲示板を作ります（管理者専用）",
-    )
-    @app_commands.default_permissions(administrator=True)
+    @admin.command(name="掲示板設置", description="全員の使用デッキ＆ランクを常時表示する掲示板を作ります")
     async def senseki_board_setup(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         embed = await self._build_board_embed()
@@ -1518,11 +1639,7 @@ class SensekiCog(commands.Cog):
     async def _before_debounced_sheets_sync(self):
         await self.bot.wait_until_ready()
 
-    @app_commands.command(
-        name="戦績シート同期",
-        description="戦績データをGoogleスプレッドシートへ即時同期します（管理者専用）",
-    )
-    @app_commands.default_permissions(administrator=True)
+    @admin.command(name="シート同期", description="戦績データをGoogleスプレッドシートへ即時同期します")
     async def senseki_sheets_sync(self, interaction: discord.Interaction):
         if senseki_sheets is None:
             await interaction.response.send_message(
@@ -1553,7 +1670,7 @@ class SensekiCog(commands.Cog):
             if "403" in str(e) or "PERMISSION" in str(e).upper():
                 hint = (
                     "\n\nスプレッドシートがサービスアカウントに共有されていない可能性があります。"
-                    "`/戦績シート診断` でメールアドレスを確認し、そのアドレスに"
+                    "`/戦績管理 シート診断` でメールアドレスを確認し、そのアドレスに"
                     "「編集者」権限で共有してください。"
                 )
             await interaction.followup.send(
@@ -1561,11 +1678,25 @@ class SensekiCog(commands.Cog):
                 ephemeral=True,
             )
 
-    @app_commands.command(
-        name="戦績シート診断",
-        description="スプレッドシート連携の設定状況を確認します（管理者専用）",
-    )
-    @app_commands.default_permissions(administrator=True)
+    @admin.command(name="診断", description="データの保存先と永続化状況を確認します")
+    async def storage_diag(self, interaction: discord.Interaction):
+        counts = await get_record_counts()
+        persistent = _is_persistent(os.path.dirname(DB_PATH))
+        body = describe_storage()
+        body += f"\n\n記録件数: {counts['matches']}件\n設定済みユーザー: {counts['users']}名"
+        warn = ""
+        if not persistent:
+            warn = (
+                "\n\n⚠️ **保存先が永続ボリュームではありません。**\n"
+                "このままだと再デプロイのたびにデータが消えます。\n"
+                "Railway の Volumes でマウント先を確認し、そのパスを環境変数 "
+                "`SENSEKI_DB_PATH` に設定してください（例：`/app/data/senseki.db`）。"
+            )
+        await interaction.response.send_message(
+            f"```\n{body}\n```{warn}", ephemeral=True
+        )
+
+    @admin.command(name="シート診断", description="スプレッドシート連携の設定状況を確認します")
     async def senseki_sheets_diag(self, interaction: discord.Interaction):
         if senseki_sheets is None:
             await interaction.response.send_message(
@@ -1573,10 +1704,30 @@ class SensekiCog(commands.Cog):
                 ephemeral=True,
             )
             return
+        config_text = senseki_sheets.describe_config()
+
+        # 何が足りないかを判定して、次にやることだけを出す
+        todo = []
+        if "未読込" in config_text:
+            todo.append(
+                "**requirements.txt に `gspread` と `google-auth` を追加**して再デプロイしてください。"
+            )
+        if "GOOGLE_SERVICE_ACCOUNT_JSON: 未設定" in config_text:
+            todo.append("Railway の Variables に `GOOGLE_SERVICE_ACCOUNT_JSON` を設定してください。")
+        if "SENSEKI_SPREADSHEET_ID: 未設定" in config_text:
+            todo.append("Railway の Variables に `SENSEKI_SPREADSHEET_ID` を設定してください。")
+
+        if todo:
+            footer = "**次にやること**\n" + "\n".join(f"{i+1}. {t}" for i, t in enumerate(todo))
+        else:
+            footer = (
+                "✅ 設定はすべて揃っています。`/戦績管理 シート同期` を実行してください。\n"
+                "-# 同期時に権限エラーが出る場合は、上記のサービスアカウントのアドレスに"
+                "スプレッドシートを「編集者」で共有できているか確認してください。"
+            )
+
         await interaction.response.send_message(
-            "```\n" + senseki_sheets.describe_config() + "\n```\n"
-            "サービスアカウントのメールアドレスに、対象スプレッドシートを"
-            "「編集者」で共有しておく必要があります。",
+            "```\n" + config_text + "\n```\n" + footer,
             ephemeral=True,
         )
 
@@ -1613,9 +1764,8 @@ class SensekiCog(commands.Cog):
         await self.bot.wait_until_ready()
 
     # ---- /戦績データ抽出 ----
-    @app_commands.command(name="戦績データ抽出", description="戦績データを生データ＋集計のExcelで出力します（管理者専用）")
+    @admin.command(name="データ抽出", description="戦績データを生データ＋集計のExcelで出力します")
     @app_commands.describe(全期間="オンにすると環境をまたいだ全データを出力します（既定は現環境のみ）")
-    @app_commands.default_permissions(administrator=True)
     async def senseki_export(self, interaction: discord.Interaction, 全期間: bool = False):
         if Workbook is None:
             await interaction.response.send_message(
@@ -1653,11 +1803,7 @@ class SensekiCog(commands.Cog):
             )
 
     # ---- /戦績全体 ----
-    @app_commands.command(
-        name="戦績全体",
-        description="サーバー全体の集計を今この瞬間のデータで表示します（管理者専用）",
-    )
-    @app_commands.default_permissions(administrator=True)
+    @admin.command(name="全体集計", description="サーバー全体の集計を今この瞬間のデータで表示します")
     async def senseki_global(self, interaction: discord.Interaction):
         g = await get_global_summary()
         total = g["total"]
@@ -1699,7 +1845,7 @@ class SensekiCog(commands.Cog):
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     # ---- /デッキ登録 ----
-    @app_commands.command(name="デッキ登録", description="よく使うデッキを登録しておきます（複数登録できます）")
+    @deck.command(name="登録", description="よく使うデッキを登録しておきます（複数登録できます）")
     @app_commands.describe(
         フォーマット="このデッキで遊ぶフォーマット",
         クラス="このデッキのクラス",
@@ -1732,18 +1878,18 @@ class SensekiCog(commands.Cog):
             return
         await interaction.response.send_message(
             f"✅ 登録しました\n{name}（{クラス.name} / {フォーマット.name}）\n\n"
-            "`/デッキ切替` で選ぶだけで使うデッキを変更できます。",
+            "`/デッキ 切替` で選ぶだけで使うデッキを変更できます。",
             ephemeral=True,
         )
 
     # ---- /デッキ切替 ----
-    @app_commands.command(name="デッキ切替", description="登録済みのデッキから、今使うデッキを選びます")
+    @deck.command(name="切替", description="登録済みのデッキから、今使うデッキを選びます")
     @app_commands.describe(削除="オンにすると、選んだデッキを登録から削除します")
     async def deck_switch(self, interaction: discord.Interaction, 削除: bool = False):
         templates = await list_templates(str(interaction.user.id))
         if not templates:
             await interaction.response.send_message(
-                "登録済みのデッキがありません。`/デッキ登録` で登録してください。",
+                "登録済みのデッキがありません。`/デッキ 登録` で登録してください。",
                 ephemeral=True,
             )
             return
@@ -1751,7 +1897,7 @@ class SensekiCog(commands.Cog):
         settings = await get_user_settings(str(interaction.user.id))
         if settings is None and not 削除:
             await interaction.response.send_message(
-                "先に `/戦績設定` でランク帯まで登録してください。", ephemeral=True
+                "先に `/戦績 設定` でランク帯まで登録してください。", ephemeral=True
             )
             return
 
@@ -1762,7 +1908,7 @@ class SensekiCog(commands.Cog):
         )
 
     # ---- /ランク更新 ----
-    @app_commands.command(name="ランク更新", description="ランク帯とグレードだけを変更します（デッキ設定はそのまま）")
+    @senseki.command(name="ランク更新", description="ランク帯とグレードだけを変更します（デッキ設定はそのまま）")
     @app_commands.describe(
         ランク帯="現在のランク帯",
         グレード="グランドマスターの方のみ必須。グレードが付いていない場合は「グレードなし」を選択",
@@ -1789,7 +1935,7 @@ class SensekiCog(commands.Cog):
         ok = await update_rank(str(interaction.user.id), rank_value, grade_value)
         if not ok:
             await interaction.response.send_message(
-                "先に `/戦績設定` で初期設定をしてください。", ephemeral=True
+                "先に `/戦績 設定` で初期設定をしてください。", ephemeral=True
             )
             return
 
@@ -1801,7 +1947,7 @@ class SensekiCog(commands.Cog):
         await self._update_board()
 
     # ---- /戦績設定 ----
-    @app_commands.command(name="戦績設定", description="フォーマット・自分のクラス・デッキタイプ・ランク帯を登録します")
+    @senseki.command(name="設定", description="フォーマット・自分のクラス・デッキタイプ・ランク帯を登録します")
     @app_commands.describe(
         フォーマット="使用するフォーマット",
         クラス="自分の使用クラス",
@@ -1862,8 +2008,8 @@ class SensekiCog(commands.Cog):
         ]
         if note:
             lines.append(note)
-        lines.append("\n`/戦績` で記録できます。相手クラス・先後・勝敗だけ入力すればOKです。")
-        lines.append("ランクが変わったら `/ランク更新`、デッキを変えるときは `/デッキ切替` が早いです。")
+        lines.append("\n`/戦績 記録` で記録できます。相手クラス・先後・勝敗だけ入力すればOKです。")
+        lines.append("ランクが変わったら `/戦績 ランク更新`、デッキを変えるときは `/デッキ 切替` が早いです。")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
         await self._update_board()
 
@@ -1872,7 +2018,7 @@ class SensekiCog(commands.Cog):
         settings = await get_user_settings(str(interaction.user.id))
         if settings is None:
             await interaction.response.send_message(
-                "先に `/戦績設定` でフォーマット・クラスを登録してください。",
+                "先に `/戦績 設定` でフォーマット・クラスを登録してください。",
                 ephemeral=True,
             )
             return
@@ -1881,19 +2027,19 @@ class SensekiCog(commands.Cog):
         await interaction.response.send_message(
             view.screen(
                 "相手クラスを選択してください。\n"
-                "-# 上の内容が違う場合は `/デッキ切替` `/ランク更新` で変更してください。"
+                "-# 上の内容が違う場合は `/デッキ 切替` `/戦績 ランク更新` で変更してください。"
             ),
             view=view,
             ephemeral=True,
         )
 
     # ---- /戦績 ----
-    @app_commands.command(name="戦績", description="対戦結果を記録します")
+    @senseki.command(name="記録", description="対戦結果を記録します")
     async def senseki_record(self, interaction: discord.Interaction):
         await self._start_record_flow(interaction)
 
     # ---- /戦績取消 ----
-    @app_commands.command(name="戦績取消", description="直前に記録した1件を取り消します")
+    @senseki.command(name="取消", description="直前に記録した1件を取り消します")
     async def senseki_undo(self, interaction: discord.Interaction):
         deleted = await delete_last_match(str(interaction.user.id))
         if deleted is None:
@@ -1909,10 +2055,7 @@ class SensekiCog(commands.Cog):
 
     # ---- /弱点対面 ----
     # SENSEKI_MEMBERS_ONLY が true になるまでは誰でも使える
-    @app_commands.command(
-        name="弱点対面",
-        description="あなたの対面別の勝率が低い相手と、おすすめの攻略記事を表示します",
-    )
+    @senseki.command(name="弱点対面", description="対面別の勝率が低い相手と、おすすめの攻略記事を表示します")
     async def weak_matchups(self, interaction: discord.Interaction):
         if SENSEKI_MEMBERS_ONLY and not is_member(interaction.user):
             await interaction.response.send_message(
@@ -1955,7 +2098,7 @@ class SensekiCog(commands.Cog):
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
     # ---- 攻略記事の管理（管理者専用） ----
-    @app_commands.command(name="攻略記事登録", description="対面ごとのおすすめ攻略記事を登録します（管理者専用）")
+    @admin.command(name="記事登録", description="対面ごとのおすすめ攻略記事を登録します")
     @app_commands.describe(
         相手クラス="この相手クラスへの対策記事",
         url="記事のURL",
@@ -1964,7 +2107,6 @@ class SensekiCog(commands.Cog):
     )
     @app_commands.choices(相手クラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES])
     @app_commands.choices(自分のクラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES])
-    @app_commands.default_permissions(administrator=True)
     async def register_guide_link(
         self,
         interaction: discord.Interaction,
@@ -1978,8 +2120,7 @@ class SensekiCog(commands.Cog):
         scope = f"{自分のクラス.name} vs {相手クラス.name}" if 自分のクラス else f"vs {相手クラス.name}（汎用）"
         await interaction.response.send_message(f"✅ 登録しました：{scope}\n{url}", ephemeral=True)
 
-    @app_commands.command(name="攻略記事一覧", description="登録済みの攻略記事を一覧表示します（管理者専用）")
-    @app_commands.default_permissions(administrator=True)
+    @admin.command(name="記事一覧", description="登録済みの攻略記事を一覧表示します")
     async def list_guide_links_cmd(self, interaction: discord.Interaction):
         links = await list_guide_links()
         if not links:
@@ -1991,14 +2132,13 @@ class SensekiCog(commands.Cog):
             lines.append(f"・{scope}：{l['url']}")
         await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
-    @app_commands.command(name="攻略記事削除", description="登録済みの攻略記事を削除します（管理者専用）")
+    @admin.command(name="記事削除", description="登録済みの攻略記事を削除します")
     @app_commands.describe(
         相手クラス="削除する記事の相手クラス",
         自分のクラス="任意：クラス指定ありで登録した記事を消す場合のみ指定",
     )
     @app_commands.choices(相手クラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES])
     @app_commands.choices(自分のクラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES])
-    @app_commands.default_permissions(administrator=True)
     async def delete_guide_link_cmd(
         self,
         interaction: discord.Interaction,
@@ -2011,7 +2151,7 @@ class SensekiCog(commands.Cog):
         await interaction.response.send_message(msg, ephemeral=True)
 
     # ---- /戦績確認 ----
-    @app_commands.command(name="戦績確認", description="今使っているデッキ・ランクと、現環境での自分の勝率を確認します")
+    @senseki.command(name="確認", description="今使っているデッキ・ランクと、現環境での自分の勝率を確認します")
     async def senseki_check(self, interaction: discord.Interaction):
         settings = await get_user_settings(str(interaction.user.id))
         lines = []
@@ -2028,7 +2168,7 @@ class SensekiCog(commands.Cog):
         summary = await get_summary(str(interaction.user.id))
         total = summary["total"]
         if total == 0:
-            lines.append("まだ記録がありません。`/戦績` で記録してみてください。")
+            lines.append("まだ記録がありません。`/戦績 記録` で記録してみてください。")
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
             return
 
@@ -2038,7 +2178,7 @@ class SensekiCog(commands.Cog):
         lines.append(
             f"📊 現在の環境での戦績\n{wins}勝{losses}敗（{total}戦）\n勝率：{win_rate:.1f}%"
         )
-        lines.append("\n対面別の弱点は `/弱点対面` で確認できます（メンバー限定）。")
+        lines.append("\n対面別の弱点は `/戦績 弱点対面` で確認できます（メンバー限定）。")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
