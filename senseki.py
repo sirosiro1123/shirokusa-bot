@@ -137,6 +137,32 @@ def _resolve_db_path() -> str:
 DB_PATH = _resolve_db_path()
 
 
+def _list_real_mounts() -> list:
+    """/proc/mounts から、データ保存に使えそうなマウントを拾う（診断用）
+
+    os.path.ismount() だけだと環境によって判定を外すことがあるため、
+    実際のマウント一覧も併せて見せて、人間が最終判断できるようにする。
+    """
+    results = []
+    try:
+        with open("/proc/mounts", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                device, mount_point, fstype = parts[0], parts[1], parts[2]
+                # 仮想FSや明らかにシステム用のものは除外
+                if fstype in ("proc", "sysfs", "devpts", "tmpfs", "cgroup", "cgroup2",
+                              "mqueue", "devtmpfs", "securityfs", "overlay"):
+                    continue
+                if mount_point in ("/", "/etc/hosts", "/etc/hostname", "/etc/resolv.conf"):
+                    continue
+                results.append(f"{mount_point}  ({fstype} / {device})")
+    except Exception as e:
+        results.append(f"（マウント情報を読めませんでした: {type(e).__name__}）")
+    return results
+
+
 def describe_storage() -> str:
     """DBの保存先と永続化状況を人間が読める形で返す（診断用）"""
     lines = [f"DBパス: {DB_PATH}"]
@@ -158,6 +184,15 @@ def describe_storage() -> str:
         mark = "マウント済み" if _is_persistent(d) else ("存在するが非マウント" if exists else "存在しない")
         has_db = "／DBあり" if os.path.exists(os.path.join(d, DB_FILENAME)) else ""
         lines.append(f"  {d}: {mark}{has_db}")
+
+    lines.append("")
+    mounts = _list_real_mounts()
+    if mounts:
+        lines.append("実際にマウントされている場所:")
+        for m in mounts:
+            lines.append(f"  {m}")
+    else:
+        lines.append("実際にマウントされている場所: なし（＝ボリューム未接続）")
     return "\n".join(lines)
 
 
