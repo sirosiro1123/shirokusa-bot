@@ -1476,6 +1476,8 @@ class SetupFlowView(discord.ui.View):
 # ==============================
 
 PANEL_SETUP_CUSTOM_ID = "senseki_panel_setup_v1"
+PANEL_CHECK_CUSTOM_ID = "senseki_panel_check_v1"
+PANEL_WEAK_CUSTOM_ID = "senseki_panel_weak_v1"
 PANEL_FORMAT_CUSTOM_ID = "senseki_panel_format_v1"
 PANEL_RECORD_CUSTOM_ID = "senseki_panel_record_v1"
 PANEL_DECK_SWITCH_CUSTOM_ID = "senseki_panel_deck_switch_v1"
@@ -1745,17 +1747,55 @@ class PanelFormatButton(discord.ui.Button):
         )
 
 
+class PanelCheckButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="成績確認",
+            style=discord.ButtonStyle.secondary,
+            emoji="📊",
+            custom_id=PANEL_CHECK_CUSTOM_ID,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("SensekiCog")
+        if cog is None:
+            await interaction.response.send_message("内部エラーです。", ephemeral=True)
+            return
+        await cog._show_check(interaction)
+
+
+class PanelWeakButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="弱点対面",
+            style=discord.ButtonStyle.secondary,
+            emoji="📉",
+            custom_id=PANEL_WEAK_CUSTOM_ID,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("SensekiCog")
+        if cog is None:
+            await interaction.response.send_message("内部エラーです。", ephemeral=True)
+            return
+        await cog._show_weak_matchups(interaction)
+
+
 class SensekiPanelView(discord.ui.View):
     """timeout=None＋固定custom_idで永続化。BOT再起動後もボタンが反応し続ける"""
 
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(PanelSetupButton())
+        # 1段目：記録まわり（よく使う順）
         self.add_item(SensekiPanelButton())
+        self.add_item(PanelUndoButton())
+        self.add_item(PanelCheckButton())
+        self.add_item(PanelWeakButton())
+        # 2段目：設定まわり
+        self.add_item(PanelSetupButton())
         self.add_item(PanelDeckSwitchButton())
         self.add_item(PanelRankUpdateButton())
         self.add_item(PanelFormatButton())
-        self.add_item(PanelUndoButton())
 
 
 # ==============================
@@ -1832,11 +1872,17 @@ class SensekiCog(commands.Cog):
     # コマンドはグループにまとめている。Discord上は
     #   /戦績 記録 ／ /戦績 設定 …
     # のように表示され、トップレベルのコマンド数は3つで済む。
+    # 一般利用はすべてパネルのボタンで完結するため、コマンドは管理者専用にして
+    # 一般メンバーのコマンド一覧に出さない（パネルが使えない時の予備手段として残す）
     senseki = app_commands.Group(
-        name="戦績", description="戦績の記録・確認・設定"
+        name="戦績",
+        description="戦績の記録・確認・設定（管理者専用。通常はパネルを使用）",
+        default_permissions=discord.Permissions(administrator=True),
     )
     deck = app_commands.Group(
-        name="デッキ", description="使用デッキの登録・切替"
+        name="デッキ",
+        description="使用デッキの登録・切替（管理者専用。通常はパネルを使用）",
+        default_permissions=discord.Permissions(administrator=True),
     )
     admin = app_commands.Group(
         name="戦績管理",
@@ -1891,11 +1937,14 @@ class SensekiCog(commands.Cog):
                 "⚔️ **戦績記録パネル**\n"
                 "ボタンはすべて押した人にだけ画面が表示されます。\n"
                 "**はじめての方は「🆕 初回設定」から**\n"
-                "・⚔️ 戦績を記録する\n"
-                "・🔄 デッキ切替（新しいデッキの登録もここから）\n"
-                "・📈 ランク更新\n"
-                "・🔀 フォーマット切替\n"
-                "・↩️ 直前の記録を取消\n"
+                "\n"
+                "**記録・確認**\n"
+                "・⚔️ 戦績を記録する　・↩️ 直前の記録を取消\n"
+                "・📊 成績確認　・📉 弱点対面\n"
+                "\n"
+                "**設定**\n"
+                "・🆕 初回設定　・🔄 デッキ切替（新規登録もここから）\n"
+                "・📈 ランク更新　・🔀 フォーマット切替\n"
                 "\n"
                 "**⚠️ 記録の前に確認してください**\n"
                 "記録画面の上部に、今のあなたのデッキとランクが表示されます。\n"
@@ -2464,8 +2513,8 @@ class SensekiCog(commands.Cog):
 
     # ---- /弱点対面 ----
     # SENSEKI_MEMBERS_ONLY が true になるまでは誰でも使える
-    @senseki.command(name="弱点対面", description="対面別の勝率が低い相手と、おすすめの攻略記事を表示します")
-    async def weak_matchups(self, interaction: discord.Interaction):
+    async def _show_weak_matchups(self, interaction: discord.Interaction):
+        """/戦績 弱点対面 とパネルのボタンの両方から呼ぶ"""
         if SENSEKI_MEMBERS_ONLY and not is_member(interaction.user):
             await interaction.response.send_message(
                 "この機能はメンバー限定です。メンバーシップについては固定メッセージをご確認ください。",
@@ -2505,6 +2554,10 @@ class SensekiCog(commands.Cog):
             f"母数が少ないうちは参考程度に見てください。"
         )
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @senseki.command(name="弱点対面", description="対面別の勝率が低い相手と、おすすめの攻略記事を表示します")
+    async def weak_matchups(self, interaction: discord.Interaction):
+        await self._show_weak_matchups(interaction)
 
     # ---- 攻略記事の管理（管理者専用） ----
     @admin.command(name="記事登録", description="対面ごとのおすすめ攻略記事を登録します")
@@ -2562,6 +2615,10 @@ class SensekiCog(commands.Cog):
     # ---- /戦績確認 ----
     @senseki.command(name="確認", description="今使っているデッキ・ランクと、現環境での自分の勝率を確認します")
     async def senseki_check(self, interaction: discord.Interaction):
+        await self._show_check(interaction)
+
+    async def _show_check(self, interaction: discord.Interaction):
+        """/戦績 確認 とパネルのボタンの両方から呼ぶ"""
         settings = await get_user_settings(str(interaction.user.id))
         lines = []
         if settings is not None:
@@ -2577,7 +2634,7 @@ class SensekiCog(commands.Cog):
         summary = await get_summary(str(interaction.user.id))
         total = summary["total"]
         if total == 0:
-            lines.append("まだ記録がありません。`/戦績 記録` で記録してみてください。")
+            lines.append("まだ記録がありません。パネルの「⚔️ 戦績を記録する」から記録してみてください。")
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
             return
 
@@ -2587,7 +2644,7 @@ class SensekiCog(commands.Cog):
         lines.append(
             f"📊 現在の環境での戦績\n{wins}勝{losses}敗（{total}戦）\n勝率：{win_rate:.1f}%"
         )
-        lines.append("\n対面別の弱点は `/戦績 弱点対面` で確認できます（メンバー限定）。")
+        lines.append("\n対面別の弱点はパネルの「📉 弱点対面」から確認できます。")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 

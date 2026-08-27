@@ -269,11 +269,13 @@ async def guide(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="vc注意事項プレビュー", description="VC入室時に表示される注意事項を自分だけに表示して確認します")
+@app_commands.default_permissions(administrator=True)
 async def preview_notice(interaction: discord.Interaction):
     await interaction.response.send_message(embed=build_notice_embed(), ephemeral=True)
 
 
 @bot.tree.command(name="vc注意事項を出す", description="今いるボイスチャンネルに注意事項を手動で表示します")
+@app_commands.default_permissions(administrator=True)
 async def post_notice(interaction: discord.Interaction):
     if interaction.user.voice is None or interaction.user.voice.channel is None:
         await interaction.response.send_message(
