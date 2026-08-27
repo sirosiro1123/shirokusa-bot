@@ -261,6 +261,12 @@ SHEETS_SYNC_MINUTE = 30
 # フェーズ3の /戦績全体 ではこの値を下回る対面は数字を出さない
 MIN_SAMPLE_FOR_STATS = 30
 
+# 相手デッキの選択画面を出し始める、候補デッキ名の最低件数
+# 0にすると候補ゼロでも画面が出る（「分からない」しか押せない状態になる）。
+# 1にしておくと、そのクラスのデッキ名が1つでも登録された時点で選択画面が出る。
+# 候補は各ユーザーが初回設定で登録した自分のデッキから自動的に貯まる。
+MIN_DECK_CANDIDATES = 1
+
 # 個人の弱点対面表示の最低試合数
 # 30戦は運用初期には現実的でないため、個人向けは緩めにする。
 # その代わり画面上に「参考値」であることを明記する。
@@ -640,6 +646,27 @@ async def update_rank(user_id: str, rank_tier: str, cr_grade) -> bool:
     return await asyncio.to_thread(_update_rank_sync, user_id, rank_tier, cr_grade)
 
 
+def _update_format_sync(user_id: str, format_: str) -> bool:
+    """フォーマットだけを更新する。クラス・デッキ・ランクは触らない"""
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT user_id FROM user_settings WHERE user_id = ?", (user_id,)).fetchone()
+        if row is None:
+            return False
+        conn.execute(
+            "UPDATE user_settings SET format = ?, updated_at = ? WHERE user_id = ?",
+            (format_, datetime.now(JST).isoformat(), user_id),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+async def update_format(user_id: str, format_: str) -> bool:
+    return await asyncio.to_thread(_update_format_sync, user_id, format_)
+
+
 def _delete_last_match_sync(user_id: str):
     conn = _connect()
     try:
@@ -909,8 +936,21 @@ class OpponentClassSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         view: SensekiFlowView = self.view
         view.opp_class = self.values[0]
-        # そのクラスで既に使われているデッキ名を候補に出す
+
+        # そのクラスで既に使われているデッキ名を候補に出す。
+        # 候補が貯まるまでは相手デッキの画面自体を出さない。
+        # 運用初期に「分からない」を押させ続けるのは手間なだけで、
+        # データも増えないため。候補は各自が登録した自分のデッキから自動的に貯まる。
         known = await get_deck_names(view.opp_class)
+        if len(known) < MIN_DECK_CANDIDATES:
+            view.opp_deck = None
+            view.show_first_second()
+            await interaction.response.edit_message(
+                content=view.screen("先攻／後攻を選んでください。"),
+                view=view,
+            )
+            return
+
         view.show_opponent_deck(known)
         await interaction.response.edit_message(
             content=view.screen(
@@ -1158,17 +1198,34 @@ def _template_label(t: dict) -> str:
 
 
 class TemplateSelect(discord.ui.Select):
+    NEW_VALUE = "__new__"
+
     def __init__(self, templates: list[dict], mode: str):
         self.mode = mode  # "switch" or "delete"
-        options = [
+        options = []
+        if mode == "switch":
+            # 候補にないデッキを、この場で登録してそのまま使えるようにする
+            options.append(
+                discord.SelectOption(label="➕ 新しいデッキを登録する…", value=self.NEW_VALUE)
+            )
+        limit = 24 if mode == "switch" else 25
+        options.extend(
             discord.SelectOption(label=_template_label(t)[:100], value=str(t["id"]))
-            for t in templates[:25]
-        ]
+            for t in templates[:limit]
+        )
         placeholder = "使うデッキを選択" if mode == "switch" else "削除するデッキを選択"
         super().__init__(placeholder=placeholder, options=options, min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
         user_id = str(interaction.user.id)
+
+        if self.values[0] == self.NEW_VALUE:
+            view = SetupFlowView(user_id, mode="newdeck")
+            await interaction.response.edit_message(
+                content=view.header("フォーマットを選んでください。"), view=view
+            )
+            return
+
         template_id = int(self.values[0])
 
         if self.mode == "delete":
@@ -1207,9 +1264,219 @@ class TemplateView(discord.ui.View):
 
 
 # ==============================
+# 初回設定フロー / 新規デッキ登録フロー（ボタンから開く）
+# ==============================
+
+class SetupFormatSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="ローテーション", value="rotation"),
+            discord.SelectOption(label="アンリミテッド", value="unlimited"),
+        ]
+        super().__init__(placeholder="フォーマットを選択", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SetupFlowView = self.view
+        view.format = self.values[0]
+        view.show_class()
+        await interaction.response.edit_message(content=view.header("クラスを選んでください。"), view=view)
+
+
+class SetupClassSelect(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label=c, value=c) for c in CLASS_CHOICES]
+        super().__init__(placeholder="使用クラスを選択", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SetupFlowView = self.view
+        view.my_class = self.values[0]
+        known = await get_deck_names(view.my_class)
+        view.show_deck(known)
+        await interaction.response.edit_message(
+            content=view.header("デッキを選んでください。候補になければ「新しく入力する…」から入力できます。"),
+            view=view,
+        )
+
+
+class SetupDeckSelect(discord.ui.Select):
+    NEW_VALUE = "__new__"
+
+    def __init__(self, known_decks: list):
+        options = [discord.SelectOption(label="新しく入力する…", value=self.NEW_VALUE)]
+        for name in known_decks[:24]:
+            options.append(discord.SelectOption(label=name[:100], value=name[:100]))
+        super().__init__(placeholder="デッキを選択", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SetupFlowView = self.view
+        if self.values[0] == self.NEW_VALUE:
+            await interaction.response.send_modal(SetupDeckModal(view))
+            return
+        view.deck = self.values[0]
+        await view.after_deck(interaction)
+
+
+class SetupDeckModal(discord.ui.Modal, title="デッキ名を入力"):
+    deck_name = discord.ui.TextInput(
+        label="デッキ名", placeholder="例：ハイランダーネメシス", required=True, max_length=50
+    )
+
+    def __init__(self, flow_view):
+        super().__init__()
+        self.flow_view = flow_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        view = self.flow_view
+        name = str(self.deck_name.value).strip()
+        if not name:
+            await interaction.response.edit_message(
+                content="デッキ名が空でした。最初からやり直してください。", view=None
+            )
+            return
+        view.deck = name
+        await view.after_deck(interaction)
+
+
+class SetupRankSelect(discord.ui.Select):
+    def __init__(self):
+        options = [discord.SelectOption(label=r, value=r) for r in RANK_TIER_CHOICES]
+        super().__init__(placeholder="ランク帯を選択", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SetupFlowView = self.view
+        view.rank = self.values[0]
+        if view.rank == GRAND_MASTER_TIER:
+            view.show_grade()
+            await interaction.response.edit_message(
+                content=view.header(
+                    f"グレードを選んでください（付いていなければ「{CR_GRADE_NONE_LABEL}」でOK）。"
+                ),
+                view=view,
+            )
+            return
+        view.grade = None
+        await view.finalize(interaction)
+
+
+class SetupGradeSelect(discord.ui.Select):
+    def __init__(self):
+        options = (
+            [discord.SelectOption(label=CR_GRADE_NONE_LABEL, value=CR_GRADE_NONE_VALUE)]
+            + [discord.SelectOption(label=g, value=g) for g in CR_GRADE_CHOICES]
+        )
+        super().__init__(placeholder="グレードを選択", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SetupFlowView = self.view
+        grade_value, _note, _err = _resolve_grade(view.rank, self.values[0])
+        view.grade = grade_value
+        await view.finalize(interaction)
+
+
+class SetupFlowView(discord.ui.View):
+    """
+    mode="setup"   … 初回設定（フォーマット→クラス→デッキ→ランク→グレード）
+    mode="newdeck" … デッキの新規登録（フォーマット→クラス→デッキ）。ランクは触らない
+    """
+
+    def __init__(self, user_id: str, mode: str = "setup"):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.mode = mode
+        self.format = None
+        self.my_class = None
+        self.deck = None
+        self.rank = None
+        self.grade = None
+        self.show_format()
+
+    def header(self, body: str) -> str:
+        title = "🆕 **初回設定**" if self.mode == "setup" else "➕ **デッキの新規登録**"
+        chosen = []
+        if self.format:
+            chosen.append(FORMAT_LABELS.get(self.format, self.format))
+        if self.my_class:
+            chosen.append(self.my_class)
+        if self.deck:
+            chosen.append(self.deck)
+        line = " / ".join(chosen)
+        return f"{title}\n{line}\n\n{body}" if line else f"{title}\n\n{body}"
+
+    def show_format(self):
+        self.clear_items()
+        self.add_item(SetupFormatSelect())
+
+    def show_class(self):
+        self.clear_items()
+        self.add_item(SetupClassSelect())
+
+    def show_deck(self, known_decks: list):
+        self.clear_items()
+        self.add_item(SetupDeckSelect(known_decks))
+
+    def show_rank(self):
+        self.clear_items()
+        self.add_item(SetupRankSelect())
+
+    def show_grade(self):
+        self.clear_items()
+        self.add_item(SetupGradeSelect())
+
+    async def after_deck(self, interaction: discord.Interaction):
+        """デッキ名が決まったあとの分岐"""
+        if self.mode == "newdeck":
+            await self.finalize(interaction)
+            return
+        self.show_rank()
+        await interaction.response.edit_message(
+            content=self.header("ランク帯を選んでください。"), view=self
+        )
+
+    async def finalize(self, interaction: discord.Interaction):
+        # どちらのモードでもテンプレートに登録しておく（次から選ぶだけで済む）
+        await add_template(self.user_id, self.format, self.my_class, self.deck)
+
+        if self.mode == "setup":
+            await upsert_user_settings(
+                self.user_id, self.format, self.my_class, self.deck, self.rank, self.grade
+            )
+            rank_label = self.rank
+            if self.grade:
+                rank_label += f"（{self.grade}）"
+            elif self.rank == GRAND_MASTER_TIER:
+                rank_label += "・グレードなし"
+            body = (
+                "✅ 設定が完了しました\n"
+                f"{FORMAT_LABELS.get(self.format, self.format)} / {self.my_class} / "
+                f"**{self.deck}** / ランク：**{rank_label}**\n\n"
+                "パネルの「⚔️ 戦績を記録する」から記録を始められます。"
+            )
+        else:
+            # 既存のランク・グレードは維持したまま、使用デッキだけ差し替える
+            current = await get_user_settings(self.user_id)
+            rank = current.get("rank_tier") if current else None
+            grade = current.get("cr_grade") if current else None
+            await upsert_user_settings(
+                self.user_id, self.format, self.my_class, self.deck, rank, grade
+            )
+            body = (
+                "✅ 登録して、使用デッキに設定しました\n"
+                f"{FORMAT_LABELS.get(self.format, self.format)} / {self.my_class} / **{self.deck}**\n"
+                "ランク帯は変更していません。"
+            )
+
+        await interaction.response.edit_message(content=body, view=None)
+        cog = interaction.client.get_cog("SensekiCog")
+        if cog is not None:
+            await cog._update_board()
+
+
+# ==============================
 # 常設パネル（/戦績パネル設置 で1回置く。ボタンは押した人にだけ反応する）
 # ==============================
 
+PANEL_SETUP_CUSTOM_ID = "senseki_panel_setup_v1"
+PANEL_FORMAT_CUSTOM_ID = "senseki_panel_format_v1"
 PANEL_RECORD_CUSTOM_ID = "senseki_panel_record_v1"
 PANEL_DECK_SWITCH_CUSTOM_ID = "senseki_panel_deck_switch_v1"
 PANEL_RANK_UPDATE_CUSTOM_ID = "senseki_panel_rank_update_v1"
@@ -1256,13 +1523,18 @@ class PanelDeckSwitchButton(discord.ui.Button):
             return
         templates = await list_templates(user_id)
         if not templates:
+            # 1つも登録がなければ、そのまま新規登録フローに入る
+            view = SetupFlowView(user_id, mode="newdeck")
             await interaction.response.send_message(
-                "登録済みのデッキがありません。`/デッキ 登録` で登録してください。",
+                view.header("登録済みのデッキがありません。フォーマットを選んでください。"),
+                view=view,
                 ephemeral=True,
             )
             return
         await interaction.response.send_message(
-            "使うデッキを選んでください。", view=TemplateView(templates, "switch"), ephemeral=True
+            "使うデッキを選んでください。候補にない場合は「➕ 新しいデッキを登録する…」を選んでください。",
+            view=TemplateView(templates, "switch"),
+            ephemeral=True,
         )
 
 
@@ -1375,14 +1647,114 @@ class PanelUndoButton(discord.ui.Button):
         )
 
 
+class PanelSetupButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="初回設定",
+            style=discord.ButtonStyle.success,
+            emoji="🆕",
+            custom_id=PANEL_SETUP_CUSTOM_ID,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = str(interaction.user.id)
+        settings = await get_user_settings(user_id)
+        if settings is not None:
+            # 共有パネルなのでボタン自体は隠せない。代わりに現状を返す
+            deck = settings.get("my_deck") or "デッキ未設定"
+            rank = settings.get("rank_tier") or "ランク未設定"
+            if settings.get("cr_grade"):
+                rank += f"・{settings['cr_grade']}"
+            elif settings.get("rank_tier") == GRAND_MASTER_TIER:
+                rank += "・グレードなし"
+            view = discord.ui.View(timeout=180)
+            view.add_item(PanelRedoSetupButton())
+            await interaction.response.send_message(
+                f"✅ すでに設定済みです\n"
+                f"**{deck}**（{settings['my_class']} / "
+                f"{FORMAT_LABELS.get(settings['format'], settings['format'])}） / "
+                f"ランク：**{rank}**\n\n"
+                "デッキやランクを変えるだけなら「🔄 デッキ切替」「📈 ランク更新」が早いです。",
+                view=view,
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            SetupFlowView(user_id).header("フォーマットを選んでください。"),
+            view=SetupFlowView(user_id),
+            ephemeral=True,
+        )
+
+
+class PanelRedoSetupButton(discord.ui.Button):
+    """設定済みの人が、あえて最初からやり直すためのボタン"""
+
+    def __init__(self):
+        super().__init__(label="最初から設定し直す", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        user_id = str(interaction.user.id)
+        view = SetupFlowView(user_id)
+        await interaction.response.edit_message(
+            content=view.header("フォーマットを選んでください。"), view=view
+        )
+
+
+class PanelFormatSelect(discord.ui.Select):
+    def __init__(self):
+        options = [
+            discord.SelectOption(label="ローテーション", value="rotation"),
+            discord.SelectOption(label="アンリミテッド", value="unlimited"),
+        ]
+        super().__init__(placeholder="フォーマットを選択", options=options)
+
+    async def callback(self, interaction: discord.Interaction):
+        value = self.values[0]
+        ok = await update_format(str(interaction.user.id), value)
+        if not ok:
+            await interaction.response.edit_message(
+                content="先に「🆕 初回設定」を済ませてください。", view=None
+            )
+            return
+        await interaction.response.edit_message(
+            content=f"✅ フォーマットを **{FORMAT_LABELS[value]}** に変更しました。", view=None
+        )
+
+
+class PanelFormatButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="フォーマット切替",
+            style=discord.ButtonStyle.secondary,
+            emoji="🔀",
+            custom_id=PANEL_FORMAT_CUSTOM_ID,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        settings = await get_user_settings(str(interaction.user.id))
+        if settings is None:
+            await interaction.response.send_message(
+                "先に「🆕 初回設定」を済ませてください。", ephemeral=True
+            )
+            return
+        now = FORMAT_LABELS.get(settings["format"], settings["format"])
+        view = discord.ui.View(timeout=180)
+        view.add_item(PanelFormatSelect())
+        await interaction.response.send_message(
+            f"現在：**{now}**\n切り替え先を選んでください。", view=view, ephemeral=True
+        )
+
+
 class SensekiPanelView(discord.ui.View):
     """timeout=None＋固定custom_idで永続化。BOT再起動後もボタンが反応し続ける"""
 
     def __init__(self):
         super().__init__(timeout=None)
+        self.add_item(PanelSetupButton())
         self.add_item(SensekiPanelButton())
         self.add_item(PanelDeckSwitchButton())
         self.add_item(PanelRankUpdateButton())
+        self.add_item(PanelFormatButton())
         self.add_item(PanelUndoButton())
 
 
@@ -1518,9 +1890,11 @@ class SensekiCog(commands.Cog):
             content=(
                 "⚔️ **戦績記録パネル**\n"
                 "ボタンはすべて押した人にだけ画面が表示されます。\n"
+                "**はじめての方は「🆕 初回設定」から**\n"
                 "・⚔️ 戦績を記録する\n"
-                "・🔄 デッキ切替\n"
+                "・🔄 デッキ切替（新しいデッキの登録もここから）\n"
                 "・📈 ランク更新\n"
+                "・🔀 フォーマット切替\n"
                 "・↩️ 直前の記録を取消\n"
                 "\n"
                 "**⚠️ 記録の前に確認してください**\n"
