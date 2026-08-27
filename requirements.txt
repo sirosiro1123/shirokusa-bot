@@ -1,2 +1,5 @@
 discord.py>=2.3.0
 anthropic
+openpyxl
+gspread
+google-auth
