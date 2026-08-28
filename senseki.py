@@ -13,7 +13,9 @@ senseki.py
     確認        今のデッキ・ランクと自分の勝率
     設定        フォーマット・クラス・デッキ・ランクを登録（全項目必須）
     ランク更新   ランク帯とグレードだけ変更（デッキは維持）
-    弱点対面     勝率の低い対面と、おすすめ攻略記事
+    弱点対面     デッキ単位（30戦から解放）：①勝率が低い対面（無料）／②全体平均より見劣りする対面（メンバー限定）
+    デッキ推移   今のフォーマットで、使ってきたデッキの変遷と成績
+    先後対面     今のデッキで、対面ごとに先攻後攻どちらが得意か
 
   /デッキ
     登録        よく使うデッキを登録（複数可）
@@ -27,6 +29,10 @@ senseki.py
     シート同期    Googleスプレッドシートへ即時同期
     シート診断    スプレッドシート連携の設定状況
     診断          DBの保存先と永続化状況（データが消える事故の確認用）
+    権限確認      指定チャンネルでBOTが持っている権限を確認
+    分析利用状況  確認・弱点対面などの分析コマンドの利用回数・利用者数
+    デッキ名統合  表記ゆれのあるデッキ名を1つに統合（過去の記録も一括書き換え）
+    無料トライアル開始／無料トライアル状況  初回参加者向け無料キャンペーンの開始とON後の状況確認
     記事登録／記事一覧／記事削除  対面ごとのおすすめ記事URLの管理
 
 【データの保存先について】
@@ -271,6 +277,10 @@ MIN_DECK_CANDIDATES = 1
 # 30戦は運用初期には現実的でないため、個人向けは緩めにする。
 # その代わり画面上に「参考値」であることを明記する。
 MIN_SAMPLE_PERSONAL = 3
+# 弱点対面ランキング（デッキ単位）：このデッキで通算これだけ戦うまではランキング非表示
+DECK_RANK_MIN_MATCHES = 30
+# ②全体平均との比較（有料）：全体側の母数がこれ未満の対面は比較対象から除外
+GLOBAL_MATCHUP_MIN_SAMPLE = 10
 
 # メンバー限定機能の判定に使うロールID（カンマ区切り、環境変数）
 # 飯テロBOTの MEMBER_ROLE_IDS と同じ方式
@@ -282,6 +292,20 @@ def _parse_role_ids(raw: str) -> set:
             ids.add(int(part))
     return ids
 
+# ②（全体平均との比較）を、有料化前に環境限定で無料開放するスイッチ。
+# 今回の環境（2026-08-beyond-2）は無料開放。次の環境に切り替える際は
+# 必ず False に戻すこと（CURRENT_ENV_ID の書き換えと同時に見直す）。
+PREMIUM_FREE_THIS_ENV = True
+
+# 初回参加者向けの無料キャンペーン：初めて `/戦績 設定` した日から何日間、
+# メンバーでなくても②が使えるか（サブ垢は別アカウント＝別トライアルとして扱う）
+TRIAL_DAYS = 30
+
+# キャンペーン自体の開始日時（bot_state に保存・管理者コマンドでON）。
+# これより「前」に初回登録していた人（＝既存ユーザー）はキャンペーン対象外。
+# こうしないと、ONにした瞬間に既存ユーザー全員が「初めての参加者」扱いになってしまう。
+TRIAL_CAMPAIGN_START_KEY = "trial_campaign_start_at"
+
 MEMBER_ROLE_IDS = _parse_role_ids(os.environ.get("MEMBER_ROLE_IDS", ""))
 
 
@@ -291,6 +315,57 @@ def is_member(user: discord.Member) -> bool:
     if not isinstance(user, discord.Member):
         return False
     return any(r.id in MEMBER_ROLE_IDS for r in user.roles)
+
+
+def _parse_iso(value: str):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=JST)
+    return dt
+
+
+def trial_days_left(started_at: str) -> int:
+    """started_at（ISO文字列）から見て、無料キャンペーンの残り日数（切り上げ・0未満は0）"""
+    start = _parse_iso(started_at)
+    if start is None:
+        return 0
+    elapsed = datetime.now(JST) - start
+    remaining = TRIAL_DAYS - elapsed.days
+    return max(0, remaining)
+
+
+def premium_access(user: discord.Member, started_at: str, campaign_start_at: str):
+    """②（有料部分）にアクセスできるか判定する。
+    戻り値: (使えるか, 理由 "member"|"env_free"|"trial"|None, トライアル残日数 or None)
+
+    トライアルが有効なのは、
+      1) キャンペーンが開始済み（campaign_start_at がある）
+      2) その人の初回登録（started_at）が、キャンペーン開始日以降
+         （＝キャンペーン開始前からの既存ユーザーは対象外）
+      3) 初回登録からTRIAL_DAYS以内
+    の全てを満たす場合のみ。
+    """
+    if is_member(user):
+        return True, "member", None
+    if PREMIUM_FREE_THIS_ENV:
+        return True, "env_free", None
+
+    campaign_start = _parse_iso(campaign_start_at)
+    start = _parse_iso(started_at)
+    if campaign_start is None or start is None:
+        return False, None, 0
+    if start < campaign_start:
+        return False, None, 0  # キャンペーン開始前からの既存ユーザーは対象外
+
+    days_left = trial_days_left(started_at)
+    if days_left > 0:
+        return True, "trial", days_left
+    return False, None, 0
 
 
 # メンバー限定機能の「有料化スイッチ」
@@ -367,7 +442,8 @@ def _init_db_sync():
                 my_deck TEXT,
                 rank_tier TEXT,
                 cr_grade TEXT,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                started_at TEXT
             )
         """)
         cur.execute("""
@@ -397,6 +473,21 @@ def _init_db_sync():
             if "cr_grade" not in cols:
                 cur.execute(f"ALTER TABLE {table} ADD COLUMN cr_grade TEXT")
 
+        user_cols = {r["name"] for r in cur.execute("PRAGMA table_info(user_settings)")}
+        if "started_at" not in user_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN started_at TEXT")
+            # 既存ユーザーは無料キャンペーン導入前からの利用者。
+            # updated_at（最終更新日時）だと直近でデッキを切替えただけの人が
+            # 「今日始めた」扱いになってしまうため、その人の一番古い記録日時
+            # （＝実際に使い始めた日）で埋める。記録が無ければ updated_at で代用。
+            cur.execute("""
+                UPDATE user_settings SET started_at = COALESCE(
+                    (SELECT MIN(recorded_at) FROM matches WHERE matches.user_id = user_settings.user_id),
+                    updated_at
+                )
+                WHERE started_at IS NULL
+            """)
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS guide_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -414,6 +505,16 @@ def _init_db_sync():
                 value TEXT
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS command_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                command TEXT NOT NULL,
+                used_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_command_usage_command ON command_usage(command)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_command_usage_used_at ON command_usage(used_at)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_user_env ON matches(user_id, env_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_env_format ON matches(env_id, format)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_matches_env_classes ON matches(env_id, my_class, opp_class)")
@@ -446,8 +547,8 @@ def _upsert_user_settings_sync(user_id: str, format_: str, my_class: str, my_dec
     try:
         now = datetime.now(JST).isoformat()
         conn.execute("""
-            INSERT INTO user_settings (user_id, format, my_class, my_deck, rank_tier, cr_grade, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO user_settings (user_id, format, my_class, my_deck, rank_tier, cr_grade, updated_at, started_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 format = excluded.format,
                 my_class = excluded.my_class,
@@ -455,7 +556,7 @@ def _upsert_user_settings_sync(user_id: str, format_: str, my_class: str, my_dec
                 rank_tier = excluded.rank_tier,
                 cr_grade = excluded.cr_grade,
                 updated_at = excluded.updated_at
-        """, (user_id, format_, my_class, my_deck, rank_tier, cr_grade, now))
+        """, (user_id, format_, my_class, my_deck, rank_tier, cr_grade, now, now))
         conn.commit()
     finally:
         conn.close()
@@ -536,6 +637,75 @@ def _get_deck_names_sync(class_name: str, limit: int = 20):
 
 async def get_deck_names(class_name: str, limit: int = 20):
     return await asyncio.to_thread(_get_deck_names_sync, class_name, limit)
+
+
+def _merge_deck_name_sync(class_name: str, old_name: str, new_name: str, mark_official: bool):
+    """表記ゆれのあるデッキ名を1つに統合する（自分側・相手側の記録、登録デッキ、候補プールを一括更新）"""
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "UPDATE matches SET my_deck = ? WHERE my_class = ? AND my_deck = ?",
+            (new_name, class_name, old_name),
+        )
+        updated_self = cur.rowcount
+
+        cur = conn.execute(
+            "UPDATE matches SET opp_deck = ? WHERE opp_class = ? AND opp_deck = ?",
+            (new_name, class_name, old_name),
+        )
+        updated_opp = cur.rowcount
+
+        # 登録デッキ（ショートカット）：同じユーザー・フォーマットに新名が既にあれば旧レコードは削除、なければ改名
+        templates = conn.execute(
+            "SELECT id, user_id, format FROM deck_templates WHERE my_class = ? AND deck_name = ?",
+            (class_name, old_name),
+        ).fetchall()
+        for t in templates:
+            exists = conn.execute(
+                "SELECT id FROM deck_templates WHERE user_id = ? AND format = ? AND my_class = ? AND deck_name = ?",
+                (t["user_id"], t["format"], class_name, new_name),
+            ).fetchone()
+            if exists:
+                conn.execute("DELETE FROM deck_templates WHERE id = ?", (t["id"],))
+            else:
+                conn.execute("UPDATE deck_templates SET deck_name = ? WHERE id = ?", (new_name, t["id"]))
+
+        # 候補プール（現環境）：件数を合算して旧レコードは削除
+        old_row = conn.execute(
+            "SELECT id, use_count FROM deck_names WHERE class_name = ? AND deck_name = ? AND env_id = ?",
+            (class_name, old_name, CURRENT_ENV_ID),
+        ).fetchone()
+        new_row = conn.execute(
+            "SELECT id, use_count FROM deck_names WHERE class_name = ? AND deck_name = ? AND env_id = ?",
+            (class_name, new_name, CURRENT_ENV_ID),
+        ).fetchone()
+        if old_row and new_row:
+            conn.execute(
+                "UPDATE deck_names SET use_count = use_count + ? WHERE id = ?",
+                (old_row["use_count"], new_row["id"]),
+            )
+            conn.execute("DELETE FROM deck_names WHERE id = ?", (old_row["id"],))
+        elif old_row and not new_row:
+            conn.execute("UPDATE deck_names SET deck_name = ? WHERE id = ?", (new_name, old_row["id"]))
+
+        if mark_official:
+            conn.execute(
+                "UPDATE deck_names SET is_official = 1 WHERE class_name = ? AND deck_name = ? AND env_id = ?",
+                (class_name, new_name, CURRENT_ENV_ID),
+            )
+
+        conn.commit()
+        return {
+            "matches_self": updated_self,
+            "matches_opp": updated_opp,
+            "templates": len(templates),
+        }
+    finally:
+        conn.close()
+
+
+async def merge_deck_name(class_name: str, old_name: str, new_name: str, mark_official: bool):
+    return await asyncio.to_thread(_merge_deck_name_sync, class_name, old_name, new_name, mark_official)
 
 
 # ---- デッキテンプレート ----
@@ -879,6 +1049,164 @@ def _get_personal_matchups_sync(user_id: str):
 
 async def get_personal_matchups(user_id: str):
     return await asyncio.to_thread(_get_personal_matchups_sync, user_id)
+
+
+def _get_deck_total_sync(user_id: str, format_: str, my_deck) -> int:
+    """指定デッキ・フォーマットでの、そのユーザーの通算試合数（現環境）"""
+    conn = _connect()
+    try:
+        row = conn.execute("""
+            SELECT COUNT(*) AS total FROM matches
+            WHERE user_id = ? AND env_id = ? AND format = ? AND my_deck = ?
+        """, (user_id, CURRENT_ENV_ID, format_, my_deck)).fetchone()
+        return row["total"] or 0
+    finally:
+        conn.close()
+
+
+async def get_deck_total(user_id: str, format_: str, my_deck) -> int:
+    return await asyncio.to_thread(_get_deck_total_sync, user_id, format_, my_deck)
+
+
+def _get_deck_matchups_sync(user_id: str, format_: str, my_deck):
+    """指定デッキ・フォーマットでの、自分の対面別成績（相手クラスごと・現環境）"""
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT opp_class, COUNT(*) AS total, SUM(is_win) AS wins
+            FROM matches
+            WHERE user_id = ? AND env_id = ? AND format = ? AND my_deck = ?
+            GROUP BY opp_class
+        """, (user_id, CURRENT_ENV_ID, format_, my_deck)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def get_deck_matchups(user_id: str, format_: str, my_deck):
+    return await asyncio.to_thread(_get_deck_matchups_sync, user_id, format_, my_deck)
+
+
+def _get_global_deck_matchups_sync(format_: str, my_deck):
+    """全ユーザーでの、同じデッキ・フォーマットにおける対面別の全体成績（現環境）"""
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT opp_class, COUNT(*) AS total, SUM(is_win) AS wins
+            FROM matches
+            WHERE env_id = ? AND format = ? AND my_deck = ?
+            GROUP BY opp_class
+        """, (CURRENT_ENV_ID, format_, my_deck)).fetchall()
+        return {r["opp_class"]: dict(r) for r in rows}
+    finally:
+        conn.close()
+
+
+async def get_global_deck_matchups(format_: str, my_deck):
+    return await asyncio.to_thread(_get_global_deck_matchups_sync, format_, my_deck)
+
+
+def _get_deck_history_sync(user_id: str, format_: str):
+    """デッキを使い始めた順に、区間ごとの試合数・勝率を返す（現環境・新しい区間が先頭）"""
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT my_deck, is_win, recorded_at
+            FROM matches
+            WHERE user_id = ? AND env_id = ? AND format = ?
+            ORDER BY recorded_at ASC
+        """, (user_id, CURRENT_ENV_ID, format_)).fetchall()
+    finally:
+        conn.close()
+
+    segments = []
+    current = None
+    for r in rows:
+        deck = r["my_deck"] or "デッキ未設定"
+        if current is None or current["deck"] != deck:
+            current = {
+                "deck": deck, "total": 0, "wins": 0,
+                "start": r["recorded_at"], "end": r["recorded_at"],
+            }
+            segments.append(current)
+        current["total"] += 1
+        current["wins"] += r["is_win"]
+        current["end"] = r["recorded_at"]
+    segments.reverse()
+    return segments
+
+
+async def get_deck_history(user_id: str, format_: str):
+    return await asyncio.to_thread(_get_deck_history_sync, user_id, format_)
+
+
+def _get_first_second_matchups_sync(user_id: str, format_: str, my_deck):
+    """指定デッキ・フォーマットでの、対面×先攻後攻別の成績（現環境）"""
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT opp_class, is_first, COUNT(*) AS total, SUM(is_win) AS wins
+            FROM matches
+            WHERE user_id = ? AND env_id = ? AND format = ? AND my_deck = ?
+            GROUP BY opp_class, is_first
+        """, (user_id, CURRENT_ENV_ID, format_, my_deck)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def get_first_second_matchups(user_id: str, format_: str, my_deck):
+    return await asyncio.to_thread(_get_first_second_matchups_sync, user_id, format_, my_deck)
+
+
+def _log_command_usage_sync(user_id: str, command: str):
+    conn = _connect()
+    try:
+        now = datetime.now(JST).isoformat()
+        conn.execute(
+            "INSERT INTO command_usage (user_id, command, used_at) VALUES (?, ?, ?)",
+            (user_id, command, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def log_command_usage(user_id: str, command: str):
+    await asyncio.to_thread(_log_command_usage_sync, user_id, command)
+
+
+def _get_command_usage_stats_sync():
+    conn = _connect()
+    try:
+        by_command = conn.execute("""
+            SELECT command, COUNT(*) AS total, COUNT(DISTINCT user_id) AS users
+            FROM command_usage GROUP BY command ORDER BY total DESC
+        """).fetchall()
+        since_30 = (datetime.now(JST) - timedelta(days=30)).isoformat()
+        recent = conn.execute("""
+            SELECT COUNT(*) AS total, COUNT(DISTINCT user_id) AS users
+            FROM command_usage WHERE used_at >= ?
+        """, (since_30,)).fetchone()
+        analyzers = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) AS n FROM command_usage"
+        ).fetchone()["n"] or 0
+        recorders = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) AS n FROM matches WHERE env_id = ?", (CURRENT_ENV_ID,)
+        ).fetchone()["n"] or 0
+        return {
+            "by_command": [dict(r) for r in by_command],
+            "recent_30_total": recent["total"] or 0,
+            "recent_30_users": recent["users"] or 0,
+            "analyzers": analyzers,
+            "recorders": recorders,
+        }
+    finally:
+        conn.close()
+
+
+async def get_command_usage_stats():
+    return await asyncio.to_thread(_get_command_usage_stats_sync)
 
 
 def _get_global_summary_sync():
@@ -1929,47 +2257,95 @@ class SensekiCog(commands.Cog):
         self.daily_sheets_sync.cancel()
         self.debounced_sheets_sync.cancel()
 
+    @staticmethod
+    def _missing_perm_message(interaction: discord.Interaction, what: str) -> str:
+        """チャンネル権限が足りないときに、何をどう直せばよいかを具体的に返す。"""
+        ch = interaction.channel
+        me = interaction.guild.me if interaction.guild else None
+        lines = [
+            f"❌ このチャンネルに{what}を設置できませんでした。",
+            "BOTに **チャンネルの権限が不足** しています。",
+            "",
+            f"**対象チャンネル**：{ch.mention if ch else '不明'}",
+        ]
+        if me is not None and ch is not None:
+            try:
+                p = ch.permissions_for(me)
+                checks = [
+                    ("チャンネルを見る", p.view_channel),
+                    ("メッセージを送信", p.send_messages),
+                    ("メッセージの管理（ピン留め用）", p.manage_messages),
+                    ("埋め込みリンク", p.embed_links),
+                ]
+                lines.append("")
+                lines.append("**現在の権限**")
+                for name, ok in checks:
+                    lines.append(f"{'✅' if ok else '❌'} {name}")
+            except Exception:
+                pass
+        lines += [
+            "",
+            "**直し方**",
+            "チャンネルの編集 → 権限 → BOT（またはBOTのロール）を追加し、",
+            "上の❌が付いた項目を許可にしてください。",
+        ]
+        return "\n".join(lines)
+
     @admin.command(name="パネル設置", description="このチャンネルに戦績記録パネルを常設します")
     async def senseki_panel_setup(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        message = await interaction.channel.send(
-            content=(
-                "⚔️ **戦績記録パネル**\n"
-                "ボタンはすべて押した人にだけ画面が表示されます。\n"
-                "**はじめての方は「🆕 初回設定」から**\n"
-                "\n"
-                "**記録・確認**\n"
-                "・⚔️ 戦績を記録する　・↩️ 直前の記録を取消\n"
-                "・📊 成績確認　・📉 弱点対面\n"
-                "\n"
-                "**設定**\n"
-                "・🆕 初回設定　・🔄 デッキ切替（新規登録もここから）\n"
-                "・📈 ランク更新　・🔀 フォーマット切替\n"
-                "\n"
-                "**⚠️ 記録の前に確認してください**\n"
-                "記録画面の上部に、今のあなたのデッキとランクが表示されます。\n"
-                "**違っていたら「🔄 デッキ切替」「📈 ランク更新」で直してから記録してください。**\n"
-                "古い設定のまま記録すると、そのデータは集計に使えなくなります。\n"
-                "間違えたときは「↩️ 直前の記録を取消」で消せます。\n"
-                "\n"
-                "**📋 データの取り扱いについて**\n"
-                "記録された戦績は、全体の統計として集計されます。\n"
-                "・個人の成績が名前つきで公開されることはありません\n"
-                "・「このデッキの全体勝率は○%」といった形で使われます\n"
-                "・集計結果は攻略記事や動画の材料になります\n"
-                "・掲示板に出るのは使用デッキとランク帯のみで、勝敗や勝率は出ません\n"
-                "-# 初回は `/戦績 設定` で先にデッキ・ランクを登録してください。"
-            ),
-            view=SensekiPanelView(),
-        )
+        try:
+            message = await interaction.channel.send(
+                content=(
+                    "⚔️ **戦績記録パネル**\n"
+                    "ボタンはすべて押した人にだけ画面が表示されます。\n"
+                    "**はじめての方は「🆕 初回設定」から**\n"
+                    "\n"
+                    "**記録・確認**\n"
+                    "・⚔️ 戦績を記録する　・↩️ 直前の記録を取消\n"
+                    "・📊 成績確認　・📉 弱点対面\n"
+                    "\n"
+                    "**設定**\n"
+                    "・🆕 初回設定　・🔄 デッキ切替（新規登録もここから）\n"
+                    "・📈 ランク更新　・🔀 フォーマット切替\n"
+                    "\n"
+                    "**⚠️ 記録の前に確認してください**\n"
+                    "記録画面の上部に、今のあなたのデッキとランクが表示されます。\n"
+                    "**違っていたら「🔄 デッキ切替」「📈 ランク更新」で直してから記録してください。**\n"
+                    "古い設定のまま記録すると、そのデータは集計に使えなくなります。\n"
+                    "間違えたときは「↩️ 直前の記録を取消」で消せます。\n"
+                    "\n"
+                    "**📋 データの取り扱いについて**\n"
+                    "記録された戦績は、全体の統計として集計されます。\n"
+                    "・個人の成績が名前つきで公開されることはありません\n"
+                    "・「このデッキの全体勝率は○%」といった形で使われます\n"
+                    "・集計結果は攻略記事や動画の材料になります\n"
+                    "・掲示板に出るのは使用デッキとランク帯のみで、勝敗や勝率は出ません\n"
+                    "-# 初回は `/戦績 設定` で先にデッキ・ランクを登録してください。"
+                ),
+                view=SensekiPanelView(),
+            )
+        except discord.Forbidden:
+            await interaction.followup.send(
+                self._missing_perm_message(interaction, "パネル"), ephemeral=True
+            )
+            return
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ パネルの設置に失敗しました: {type(e).__name__}: {e}", ephemeral=True
+            )
+            return
+
+        pinned = True
         try:
             await message.pin()
         except discord.Forbidden:
-            await interaction.followup.send(
-                "パネルは作成しましたが、ピン留めの権限がなかったため手動で留めてください。",
-                ephemeral=True,
-            )
-        await interaction.followup.send("✅ パネルを設置しました。", ephemeral=True)
+            pinned = False
+        except discord.HTTPException:
+            pinned = False
+
+        note = "" if pinned else "\n-# ピン留めの権限がないため、手動でピン留めしてください。"
+        await interaction.followup.send(f"✅ パネルを設置しました。{note}", ephemeral=True)
 
     # ---- 現状掲示板（全プレイヤーのデッキ＆ランク一覧） ----
 
@@ -2034,17 +2410,31 @@ class SensekiCog(commands.Cog):
     async def senseki_board_setup(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         embed = await self._build_board_embed()
-        message = await interaction.channel.send(embed=embed)
+        try:
+            message = await interaction.channel.send(embed=embed)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                self._missing_perm_message(interaction, "掲示板"), ephemeral=True
+            )
+            return
+        except Exception as e:
+            await interaction.followup.send(
+                f"❌ 掲示板の設置に失敗しました: {type(e).__name__}: {e}", ephemeral=True
+            )
+            return
+
+        pinned = True
         try:
             await message.pin()
         except discord.Forbidden:
-            await interaction.followup.send(
-                "掲示板は作成しましたが、ピン留めの権限がなかったため手動で留めてください。",
-                ephemeral=True,
-            )
+            pinned = False
+        except discord.HTTPException:
+            pinned = False
+
         await set_state(self.BOARD_CHANNEL_KEY, str(interaction.channel.id))
         await set_state(self.BOARD_MESSAGE_KEY, str(message.id))
-        await interaction.followup.send("✅ 掲示板を設置しました。", ephemeral=True)
+        note = "" if pinned else "\n-# ピン留めの権限がないため、手動でピン留めしてください。"
+        await interaction.followup.send(f"✅ 掲示板を設置しました。{note}", ephemeral=True)
 
     # ---- Googleスプレッドシート同期 ----
 
@@ -2135,6 +2525,167 @@ class SensekiCog(commands.Cog):
                 f"同期に失敗しました。\n```\n{type(e).__name__}: {e}\n```{hint}",
                 ephemeral=True,
             )
+
+    @admin.command(name="権限確認", description="このチャンネルでBOTが持っている権限を確認します")
+    @app_commands.describe(channel="確認したいチャンネル（省略すると今いるチャンネル）")
+    async def perm_check(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.TextChannel | None = None,
+    ):
+        target = channel or interaction.channel
+        me = interaction.guild.me if interaction.guild else None
+        if me is None or target is None:
+            await interaction.response.send_message(
+                "チャンネル情報を取得できませんでした。", ephemeral=True
+            )
+            return
+
+        p = target.permissions_for(me)
+        items = [
+            ("チャンネルを見る", p.view_channel, "これが❌だとBOTからチャンネルが存在しない扱いになります（50001）"),
+            ("メッセージを送信", p.send_messages, "パネル・掲示板・通知の投稿に必要"),
+            ("メッセージの管理", p.manage_messages, "パネルの自動ピン留めに必要"),
+            ("埋め込みリンク", p.embed_links, "Embed（掲示板・通知）の表示に必要"),
+            ("メッセージ履歴を読む", p.read_message_history, "掲示板の更新に必要"),
+        ]
+        lines = [f"**{target.mention} でのBOTの権限**", ""]
+        ng = []
+        for name, ok, why in items:
+            lines.append(f"{'✅' if ok else '❌'} {name}")
+            if not ok:
+                ng.append(f"・**{name}** — {why}")
+
+        if ng:
+            lines += [
+                "",
+                "**不足している権限**",
+                *ng,
+                "",
+                "チャンネルの編集 → 権限 → BOT（またはBOTのロール）を追加して許可してください。",
+            ]
+        else:
+            lines += ["", "問題ありません。"]
+
+        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+
+    @admin.command(name="分析利用状況", description="分析系コマンド（確認・弱点対面など）の利用状況を確認します")
+    async def usage_stats_cmd(self, interaction: discord.Interaction):
+        stats = await get_command_usage_stats()
+        lines = ["📊 **分析コマンドの利用状況**"]
+        if not stats["by_command"]:
+            lines.append("まだ利用ログがありません。")
+            await interaction.response.send_message("\n".join(lines), ephemeral=True)
+            return
+
+        for row in stats["by_command"]:
+            lines.append(f"・{row['command']}：{row['total']}回（{row['users']}名）")
+
+        lines.append(f"\n直近30日：{stats['recent_30_total']}回（{stats['recent_30_users']}名）")
+
+        recorders = stats["recorders"]
+        analyzers = stats["analyzers"]
+        rate = (analyzers / recorders * 100) if recorders else 0
+        lines.append(
+            f"\n戦績を記録したことがある人：{recorders}名\n"
+            f"分析コマンドを使ったことがある人：{analyzers}名（記録者の{rate:.0f}%）"
+        )
+        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+    @admin.command(name="無料トライアル開始", description="初回参加者向け無料トライアルキャンペーンを開始します（このコマンド実行以降に初回登録した人だけが対象）")
+    @app_commands.describe(
+        上書き="既に開始済みでも、今の日時で開始日を上書きする場合はオン（通常は使いません）",
+    )
+    async def start_trial_campaign_cmd(
+        self, interaction: discord.Interaction, 上書き: bool = False
+    ):
+        existing = await get_state(TRIAL_CAMPAIGN_START_KEY)
+        if existing and not 上書き:
+            await interaction.response.send_message(
+                f"⚠️ 無料トライアルキャンペーンは既に **{existing[:19].replace('T', ' ')}** から開始済みです。\n"
+                f"開始日を今の日時に上書きしたい場合は「上書き」をオンにして再実行してください。",
+                ephemeral=True,
+            )
+            return
+
+        now = datetime.now(JST).isoformat()
+        await set_state(TRIAL_CAMPAIGN_START_KEY, now)
+        await interaction.response.send_message(
+            f"✅ 無料トライアルキャンペーンを開始しました（開始日時：{now[:19].replace('T', ' ')}）\n\n"
+            f"これ以降に `/戦績 設定` を初めて実行した人だけが対象になります。\n"
+            f"それ以前から使っている既存ユーザーは対象外です（今の環境は"
+            + ("引き続き全員無料のままです。" if PREMIUM_FREE_THIS_ENV else "既に有料化されています。")
+            + f"）\nトライアル期間：{TRIAL_DAYS}日間",
+            ephemeral=True,
+        )
+
+    @admin.command(name="無料トライアル状況", description="無料トライアルキャンペーンの開始日と、現在トライアル中の人数を確認します")
+    async def trial_campaign_status_cmd(self, interaction: discord.Interaction):
+        started = await get_state(TRIAL_CAMPAIGN_START_KEY)
+        if not started:
+            await interaction.response.send_message(
+                "まだ無料トライアルキャンペーンは開始していません。"
+                "`/戦績管理 無料トライアル開始` で開始できます。",
+                ephemeral=True,
+            )
+            return
+
+        rows = await fetch_all_user_settings()
+        in_trial = 0
+        for r in rows.values():
+            s = r.get("started_at")
+            if not s:
+                continue
+            start = _parse_iso(s)
+            campaign_start = _parse_iso(started)
+            if start and campaign_start and start >= campaign_start and trial_days_left(s) > 0:
+                in_trial += 1
+
+        await interaction.response.send_message(
+            f"📅 無料トライアルキャンペーン開始日：{started[:19].replace('T', ' ')}\n"
+            f"現在トライアル中の人数：{in_trial}名\n"
+            f"（現在の環境は" + ("全員無料のため、トライアルの有無に関わらず②が使えます。" if PREMIUM_FREE_THIS_ENV else "有料化済みです。") + "）",
+            ephemeral=True,
+        )
+
+    @admin.command(name="デッキ名統合", description="表記ゆれのあるデッキ名を1つに統合します（過去の記録も書き換えます）")
+    @app_commands.describe(
+        クラス="対象クラス",
+        統合前デッキ名="書き換え前のデッキ名（表記ゆれの方。完全一致で指定）",
+        統合後デッキ名="正式名として残すデッキ名",
+        公式デッキにする="今後の候補一覧で優先表示する場合はオン（デフォルトON）",
+    )
+    @app_commands.choices(クラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES])
+    async def merge_deck_names_cmd(
+        self,
+        interaction: discord.Interaction,
+        クラス: app_commands.Choice[str],
+        統合前デッキ名: str,
+        統合後デッキ名: str,
+        公式デッキにする: bool = True,
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        old_name = 統合前デッキ名.strip()
+        new_name = 統合後デッキ名.strip()
+        if not old_name or not new_name:
+            await interaction.followup.send("デッキ名が空です。", ephemeral=True)
+            return
+        if old_name == new_name:
+            await interaction.followup.send("統合前後で同じ名前です。", ephemeral=True)
+            return
+
+        result = await merge_deck_name(クラス.value, old_name, new_name, 公式デッキにする)
+        mark_dirty()
+
+        note = "\n・今後の候補一覧で優先表示されるようにしました。" if 公式デッキにする else ""
+        await interaction.followup.send(
+            f"✅ **{クラス.name}**：「{old_name}」→「{new_name}」に統合しました\n"
+            f"・自分側のデッキとして記録された試合：{result['matches_self']}件\n"
+            f"・相手側のデッキとして記録された試合：{result['matches_opp']}件\n"
+            f"・登録デッキ（ショートカット）：{result['templates']}件"
+            + note,
+            ephemeral=True,
+        )
 
     @admin.command(name="診断", description="データの保存先と永続化状況を確認します")
     async def storage_diag(self, interaction: discord.Interaction):
@@ -2512,7 +3063,10 @@ class SensekiCog(commands.Cog):
         )
 
     # ---- /弱点対面 ----
-    # SENSEKI_MEMBERS_ONLY が true になるまでは誰でも使える
+    # SENSEKI_MEMBERS_ONLY が true になるまで①②とも誰でも使える（コマンド自体の公開範囲）。
+    # ②（全体平均との比較）は premium_access() で個別に判定：
+    #   会員 / 今の環境が無料開放中(PREMIUM_FREE_THIS_ENV) / 初回登録から TRIAL_DAYS 日以内
+    #   のいずれかを満たせば表示。次の環境ではPREMIUM_FREE_THIS_ENVをFalseに戻すこと。
     async def _show_weak_matchups(self, interaction: discord.Interaction):
         """/戦績 弱点対面 とパネルのボタンの両方から呼ぶ"""
         if SENSEKI_MEMBERS_ONLY and not is_member(interaction.user):
@@ -2522,11 +3076,33 @@ class SensekiCog(commands.Cog):
             )
             return
 
-        rows = await get_personal_matchups(str(interaction.user.id))
-        candidates = [r for r in rows if r["total"] >= MIN_SAMPLE_PERSONAL]
+        settings = await get_user_settings(str(interaction.user.id))
+        if settings is None or not settings.get("my_deck"):
+            await interaction.response.send_message(
+                "まず `/戦績 設定` で使用デッキを登録してください。", ephemeral=True
+            )
+            return
+
+        format_ = settings["format"]
+        format_label = "ローテーション" if format_ == "rotation" else "アンリミテッド"
+        my_class = settings["my_class"]
+        my_deck = settings["my_deck"]
+
+        deck_total = await get_deck_total(str(interaction.user.id), format_, my_deck)
+        if deck_total < DECK_RANK_MIN_MATCHES:
+            await interaction.response.send_message(
+                f"**{my_deck}**（{format_label}）はまだ{deck_total}戦です。\n"
+                f"このデッキで通算{DECK_RANK_MIN_MATCHES}戦たまると弱点対面ランキングが表示されます"
+                f"（あと{DECK_RANK_MIN_MATCHES - deck_total}戦）。",
+                ephemeral=True,
+            )
+            return
+
+        rows = await get_deck_matchups(str(interaction.user.id), format_, my_deck)
+        candidates = [dict(r) for r in rows if r["total"] >= MIN_SAMPLE_PERSONAL]
         if not candidates:
             await interaction.response.send_message(
-                f"まだ判定できるだけのデータがありません"
+                f"**{my_deck}**（{format_label}）はまだ判定できるだけのデータがありません"
                 f"（同じ対面が{MIN_SAMPLE_PERSONAL}戦以上たまると表示されます）。",
                 ephemeral=True,
             )
@@ -2534,30 +3110,160 @@ class SensekiCog(commands.Cog):
 
         for r in candidates:
             r["win_rate"] = r["wins"] / r["total"] * 100
-        candidates.sort(key=lambda r: r["win_rate"])
-        worst = candidates[:3]
 
-        lines = ["📉 **あなたの弱点対面**（現環境・参考値）"]
-        for r in worst:
+        lines = [f"📉 **{my_deck}の弱点対面**（{format_label}・現環境）"]
+
+        # ① 単純に勝率が低い対面（無料）
+        raw_sorted = sorted(candidates, key=lambda r: r["win_rate"])
+        raw_worst = raw_sorted[:3]
+        lines.append("\n**① 勝率が低い対面**")
+        for r in raw_worst:
             lines.append(
-                f"\n**{r['my_class']}** vs **{r['opp_class']}**："
+                f"・**{my_class}** vs **{r['opp_class']}**："
                 f"勝率 {r['win_rate']:.1f}%（{r['wins']}勝{r['total']-r['wins']}敗・{r['total']}戦）"
             )
-            link = await find_guide_link(r["my_class"], r["opp_class"])
+            link = await find_guide_link(my_class, r["opp_class"])
             if link:
-                lines.append(f"📖 {link['url']}")
-                if link.get("note"):
-                    lines.append(f"　{link['note']}")
+                lines.append(f"　📖 {link['url']}" + (f"　{link['note']}" if link.get("note") else ""))
+
+        # ② 全体平均より見劣りする対面（メンバー限定・環境限定無料／初回30日間無料キャンペーンあり）
+        lines.append("\n**② 全体平均より見劣りする対面**")
+        unlocked, reason, days_left = premium_access(
+            interaction.user, settings.get("started_at"), await get_state(TRIAL_CAMPAIGN_START_KEY)
+        )
+        if not unlocked:
+            lines.append(
+                "-# この項目はメンバー限定です。自分の勝率は良くても、"
+                "他プレイヤーの平均と比べると見劣りする対面が分かります。"
+            )
+        else:
+            global_map = await get_global_deck_matchups(format_, my_deck)
+            deviations = []
+            for r in candidates:
+                g = global_map.get(r["opp_class"])
+                if not g or g["total"] < GLOBAL_MATCHUP_MIN_SAMPLE:
+                    continue
+                global_rate = g["wins"] / g["total"] * 100
+                deviations.append({**r, "global_rate": global_rate, "diff": r["win_rate"] - global_rate})
+
+            if not deviations:
+                lines.append("-# 比較できるだけの全体データがまだ足りません。")
+            else:
+                deviations.sort(key=lambda r: r["diff"])
+                for r in deviations[:3]:
+                    lines.append(
+                        f"・**{my_class}** vs **{r['opp_class']}**："
+                        f"あなた {r['win_rate']:.1f}%（全体平均 {r['global_rate']:.1f}% / "
+                        f"乖離 {r['diff']:+.1f}%）"
+                    )
+                    link = await find_guide_link(my_class, r["opp_class"])
+                    if link:
+                        lines.append(f"　📖 {link['url']}" + (f"　{link['note']}" if link.get("note") else ""))
+                await log_command_usage(str(interaction.user.id), "弱点対面_全体比較")
+
+            if reason == "trial" and days_left <= 7:
+                lines.append(f"\n🎁 無料キャンペーン期間中（あと{days_left}日で終了）")
 
         lines.append(
-            f"\n-# {MIN_SAMPLE_PERSONAL}戦以上あれば表示されますが、"
-            f"母数が少ないうちは参考程度に見てください。"
+            f"\n-# 対面ごとに{MIN_SAMPLE_PERSONAL}戦、全体比較は全体側{GLOBAL_MATCHUP_MIN_SAMPLE}戦以上のものだけ表示しています。"
         )
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await log_command_usage(str(interaction.user.id), "弱点対面")
+        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
     @senseki.command(name="弱点対面", description="対面別の勝率が低い相手と、おすすめの攻略記事を表示します")
     async def weak_matchups(self, interaction: discord.Interaction):
         await self._show_weak_matchups(interaction)
+
+    # ---- /戦績 デッキ推移 ----
+    @senseki.command(name="デッキ推移", description="今のフォーマットで、これまで使ってきたデッキの変遷と成績を表示します")
+    async def deck_history_cmd(self, interaction: discord.Interaction):
+        settings = await get_user_settings(str(interaction.user.id))
+        if settings is None:
+            await interaction.response.send_message(
+                "まず `/戦績 設定` で登録してください。", ephemeral=True
+            )
+            return
+        format_ = settings["format"]
+        format_label = "ローテーション" if format_ == "rotation" else "アンリミテッド"
+
+        segments = await get_deck_history(str(interaction.user.id), format_)
+        if not segments:
+            await interaction.response.send_message(
+                f"{format_label}での記録がまだありません。", ephemeral=True
+            )
+            return
+
+        lines = [f"📈 **デッキ推移**（{format_label}・新しい順）"]
+        for seg in segments[:10]:
+            win_rate = seg["wins"] / seg["total"] * 100 if seg["total"] else 0
+            start = seg["start"][:10]
+            end = seg["end"][:10]
+            period = start if start == end else f"{start}〜{end}"
+            lines.append(
+                f"・**{seg['deck']}**：{seg['wins']}勝{seg['total']-seg['wins']}敗"
+                f"（{seg['total']}戦・勝率{win_rate:.1f}%）　{period}"
+            )
+        if len(segments) > 10:
+            lines.append(f"\n-# 直近10区間のみ表示しています（全{len(segments)}区間）。")
+
+        await log_command_usage(str(interaction.user.id), "デッキ推移")
+        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+    # ---- /戦績 先後対面 ----
+    @senseki.command(name="先後対面", description="今のデッキで、対面ごとに先攻後攻どちらが得意かを表示します")
+    async def first_second_cmd(self, interaction: discord.Interaction):
+        settings = await get_user_settings(str(interaction.user.id))
+        if settings is None or not settings.get("my_deck"):
+            await interaction.response.send_message(
+                "まず `/戦績 設定` で使用デッキを登録してください。", ephemeral=True
+            )
+            return
+        format_ = settings["format"]
+        format_label = "ローテーション" if format_ == "rotation" else "アンリミテッド"
+        my_deck = settings["my_deck"]
+
+        rows = await get_first_second_matchups(str(interaction.user.id), format_, my_deck)
+        by_opp = {}
+        for r in rows:
+            d = by_opp.setdefault(r["opp_class"], {})
+            d["first" if r["is_first"] else "second"] = r
+
+        results = []
+        for opp_class, d in by_opp.items():
+            first = d.get("first")
+            second = d.get("second")
+            if not first or not second:
+                continue
+            if first["total"] < MIN_SAMPLE_PERSONAL or second["total"] < MIN_SAMPLE_PERSONAL:
+                continue
+            first_rate = first["wins"] / first["total"] * 100
+            second_rate = second["wins"] / second["total"] * 100
+            results.append({
+                "opp_class": opp_class, "first_rate": first_rate, "second_rate": second_rate,
+                "first_total": first["total"], "second_total": second["total"],
+                "diff": first_rate - second_rate,
+            })
+
+        if not results:
+            await interaction.response.send_message(
+                f"**{my_deck}**（{format_label}）は、先攻・後攻それぞれ{MIN_SAMPLE_PERSONAL}戦以上ある"
+                f"対面がまだありません。", ephemeral=True,
+            )
+            return
+
+        results.sort(key=lambda r: abs(r["diff"]), reverse=True)
+        lines = [f"🔀 **{my_deck}の先攻・後攻別対面**（{format_label}・現環境）"]
+        for r in results[:5]:
+            favor = "先攻" if r["diff"] > 0 else "後攻"
+            lines.append(
+                f"・**{r['opp_class']}** 戦：先攻 {r['first_rate']:.1f}%"
+                f"（{r['first_total']}戦） / 後攻 {r['second_rate']:.1f}%（{r['second_total']}戦）"
+                f"　→ {favor}が得意（差 {abs(r['diff']):.1f}%）"
+            )
+        lines.append(f"\n-# 先攻・後攻それぞれ{MIN_SAMPLE_PERSONAL}戦以上ある対面のみ表示しています。")
+
+        await log_command_usage(str(interaction.user.id), "先後対面")
+        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
     # ---- 攻略記事の管理（管理者専用） ----
     @admin.command(name="記事登録", description="対面ごとのおすすめ攻略記事を登録します")
@@ -2645,6 +3351,7 @@ class SensekiCog(commands.Cog):
             f"📊 現在の環境での戦績\n{wins}勝{losses}敗（{total}戦）\n勝率：{win_rate:.1f}%"
         )
         lines.append("\n対面別の弱点はパネルの「📉 弱点対面」から確認できます。")
+        await log_command_usage(str(interaction.user.id), "確認")
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
 
