@@ -667,6 +667,14 @@ def _merge_deck_name_sync(class_name: str, old_name: str, new_name: str, mark_of
         )
         updated_opp = cur.rowcount
 
+        # 現在の設定（今まさに使っているデッキ）：ここを更新しないと、
+        # デッキ切替を手動でやり直すまで確認・弱点対面などに反映されない
+        cur = conn.execute(
+            "UPDATE user_settings SET my_deck = ? WHERE my_class = ? AND my_deck = ?",
+            (new_name, class_name, old_name),
+        )
+        updated_current = cur.rowcount
+
         # 登録デッキ（ショートカット）：同じユーザー・フォーマットに新名が既にあれば旧レコードは削除、なければ改名
         templates = conn.execute(
             "SELECT id, user_id, format FROM deck_templates WHERE my_class = ? AND deck_name = ?",
@@ -711,6 +719,7 @@ def _merge_deck_name_sync(class_name: str, old_name: str, new_name: str, mark_of
             "matches_self": updated_self,
             "matches_opp": updated_opp,
             "templates": len(templates),
+            "current_settings": updated_current,
         }
     finally:
         conn.close()
@@ -2781,7 +2790,8 @@ class SensekiCog(commands.Cog):
             f"✅ **{クラス.name}**：「{old_name}」→「{new_name}」に統合しました\n"
             f"・自分側のデッキとして記録された試合：{result['matches_self']}件\n"
             f"・相手側のデッキとして記録された試合：{result['matches_opp']}件\n"
-            f"・登録デッキ（ショートカット）：{result['templates']}件"
+            f"・登録デッキ（ショートカット）：{result['templates']}件\n"
+            f"・今まさにこのデッキを使用中だった人：{result['current_settings']}名（切替不要で反映済み）"
             + note,
             ephemeral=True,
         )
