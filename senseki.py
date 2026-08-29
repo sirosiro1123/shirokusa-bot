@@ -17,6 +17,7 @@ senseki.py
     弱点対面     デッキ単位（30戦から解放）：①勝率が低い対面（無料）／②全体平均より見劣りする対面（メンバー限定）
     デッキ推移   今のフォーマットで、使ってきたデッキの変遷と成績
     先後対面     今のデッキで、対面ごとに先攻後攻どちらが得意か
+    相手デッキ対面 今のデッキで、相手デッキ別の勝率（十分なデータがあれば先攻後攻も）
 
   /デッキ
     登録        よく使うデッキを登録（複数可）
@@ -279,6 +280,11 @@ MIN_DECK_CANDIDATES = 1
 # その代わり画面上に「参考値」であることを明記する。
 # /戦績 確認 で無料で見せる「直近」の試合数（シャドバのリプレイ保存数と合わせる）
 RECENT_FREE_MATCHES = 30
+
+# 相手デッキ単位の対面：これだけ戦えば「勝率」を表示（弱点対面の対面別しきい値と同じ）
+MIN_SAMPLE_OPPDECK = 3
+# 相手デッキ単位の対面：先攻・後攻それぞれこれだけ戦えば内訳も追加表示
+MIN_SAMPLE_OPPDECK_FS = 5
 
 MIN_SAMPLE_PERSONAL = 3
 # 弱点対面ランキング（デッキ単位）：このデッキで通算これだけ戦うまではランキング非表示
@@ -1216,6 +1222,25 @@ def _get_first_second_matchups_sync(user_id: str, format_: str, my_deck):
 
 async def get_first_second_matchups(user_id: str, format_: str, my_deck):
     return await asyncio.to_thread(_get_first_second_matchups_sync, user_id, format_, my_deck)
+
+
+def _get_deck_opp_deck_fs_sync(user_id: str, format_: str, my_deck):
+    """指定デッキ・フォーマットでの、相手デッキ×先攻後攻別の成績（現環境）"""
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT opp_class, opp_deck, is_first, COUNT(*) AS total, SUM(is_win) AS wins
+            FROM matches
+            WHERE user_id = ? AND env_id = ? AND format = ? AND my_deck = ? AND opp_deck IS NOT NULL
+            GROUP BY opp_class, opp_deck, is_first
+        """, (user_id, CURRENT_ENV_ID, format_, my_deck)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def get_deck_opp_deck_fs(user_id: str, format_: str, my_deck):
+    return await asyncio.to_thread(_get_deck_opp_deck_fs_sync, user_id, format_, my_deck)
 
 
 def _log_command_usage_sync(user_id: str, command: str):
@@ -3335,6 +3360,75 @@ class SensekiCog(commands.Cog):
         lines.append(f"\n-# 先攻・後攻それぞれ{MIN_SAMPLE_PERSONAL}戦以上ある対面のみ表示しています。")
 
         await log_command_usage(str(interaction.user.id), "先後対面")
+        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+    # ---- /戦績 相手デッキ対面 ----
+    @senseki.command(name="相手デッキ対面", description="今のデッキで、相手デッキ別の勝率を表示します（データが十分あれば先攻後攻も）")
+    async def opp_deck_matchup_cmd(self, interaction: discord.Interaction):
+        settings = await get_user_settings(str(interaction.user.id))
+        if settings is None or not settings.get("my_deck"):
+            await interaction.response.send_message(
+                "まず `/戦績 設定` で使用デッキを登録してください。", ephemeral=True
+            )
+            return
+        format_ = settings["format"]
+        format_label = "ローテーション" if format_ == "rotation" else "アンリミテッド"
+        my_deck = settings["my_deck"]
+
+        rows = await get_deck_opp_deck_fs(str(interaction.user.id), format_, my_deck)
+        by_key = {}
+        for r in rows:
+            key = (r["opp_class"], r["opp_deck"])
+            d = by_key.setdefault(key, {
+                "total": 0, "wins": 0,
+                "first_total": 0, "first_wins": 0,
+                "second_total": 0, "second_wins": 0,
+            })
+            d["total"] += r["total"]
+            d["wins"] += r["wins"]
+            if r["is_first"]:
+                d["first_total"] += r["total"]
+                d["first_wins"] += r["wins"]
+            else:
+                d["second_total"] += r["total"]
+                d["second_wins"] += r["wins"]
+
+        entries = [
+            {"opp_class": k[0], "opp_deck": k[1], **v}
+            for k, v in by_key.items() if v["total"] >= MIN_SAMPLE_OPPDECK
+        ]
+        if not entries:
+            await interaction.response.send_message(
+                f"**{my_deck}**（{format_label}）は、相手デッキが分かる対面が"
+                f"まだ{MIN_SAMPLE_OPPDECK}戦以上たまっていません。\n"
+                f"-# 対戦相手のデッキ名を入力して記録すると、ここに表示されるようになります。",
+                ephemeral=True,
+            )
+            return
+
+        entries.sort(key=lambda r: r["total"], reverse=True)
+        lines = [f"🎯 **{my_deck}の相手デッキ別対面**（{format_label}・現環境）"]
+        for r in entries[:8]:
+            rate = r["wins"] / r["total"] * 100
+            lines.append(
+                f"・**{r['opp_class']}**（{r['opp_deck']}）：勝率 {rate:.1f}%"
+                f"（{r['wins']}勝{r['total']-r['wins']}敗・{r['total']}戦）"
+            )
+            if r["first_total"] >= MIN_SAMPLE_OPPDECK_FS and r["second_total"] >= MIN_SAMPLE_OPPDECK_FS:
+                first_rate = r["first_wins"] / r["first_total"] * 100
+                second_rate = r["second_wins"] / r["second_total"] * 100
+                lines.append(
+                    f"　先攻 {first_rate:.1f}%（{r['first_total']}戦） / "
+                    f"後攻 {second_rate:.1f}%（{r['second_total']}戦）"
+                )
+            else:
+                lines.append(f"　-# 先攻後攻は各{MIN_SAMPLE_OPPDECK_FS}戦以上貯まると内訳が出ます")
+
+        if len(entries) > 8:
+            lines.append(f"\n-# 対戦数の多い順に8件のみ表示しています（全{len(entries)}件）。")
+        lines.append(f"-# 相手デッキは{MIN_SAMPLE_OPPDECK}戦以上あるものだけ表示しています。")
+
+        await log_command_usage(str(interaction.user.id), "相手デッキ対面")
         await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
     # ---- 攻略記事の管理（管理者専用） ----

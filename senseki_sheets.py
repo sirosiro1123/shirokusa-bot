@@ -126,7 +126,7 @@ def sync_to_sheets(matches: list[dict], format_labels: dict, resolve_name) -> di
     raw_rows = [[
         "記録日時", "ユーザー", "ユーザーID", "環境ID", "フォーマット",
         "自分のクラス", "自分のデッキ", "ランク帯", "グレード",
-        "相手クラス", "先攻/後攻", "勝敗",
+        "相手クラス", "相手デッキ", "先攻/後攻", "勝敗",
     ]]
     for m in matches:
         raw_rows.append([
@@ -141,6 +141,7 @@ def sync_to_sheets(matches: list[dict], format_labels: dict, resolve_name) -> di
             m.get("rank_tier") or "",
             m.get("cr_grade") or "",
             m["opp_class"],
+            m.get("opp_deck") or "",
             "先攻" if m["is_first"] else "後攻",
             "勝ち" if m["is_win"] else "負け",
         ])
