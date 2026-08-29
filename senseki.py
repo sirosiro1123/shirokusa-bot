@@ -10,7 +10,8 @@ senseki.py
   /戦績
     記録        対戦結果を記録（ボタン形式）
     取消        直前の1件を取り消し
-    確認        今のデッキ・ランクと自分の勝率
+    確認        今のデッキの直近30戦の勝率（無料）と通算勝率（30戦超・メンバー限定）
+    履歴        直近10戦の対戦履歴（自分の分のみ）
     設定        フォーマット・クラス・デッキ・ランクを登録（全項目必須）
     ランク更新   ランク帯とグレードだけ変更（デッキは維持）
     弱点対面     デッキ単位（30戦から解放）：①勝率が低い対面（無料）／②全体平均より見劣りする対面（メンバー限定）
@@ -276,6 +277,9 @@ MIN_DECK_CANDIDATES = 1
 # 個人の弱点対面表示の最低試合数
 # 30戦は運用初期には現実的でないため、個人向けは緩めにする。
 # その代わり画面上に「参考値」であることを明記する。
+# /戦績 確認 で無料で見せる「直近」の試合数（シャドバのリプレイ保存数と合わせる）
+RECENT_FREE_MATCHES = 30
+
 MIN_SAMPLE_PERSONAL = 3
 # 弱点対面ランキング（デッキ単位）：このデッキで通算これだけ戦うまではランキング非表示
 DECK_RANK_MIN_MATCHES = 30
@@ -1068,6 +1072,61 @@ async def get_deck_total(user_id: str, format_: str, my_deck) -> int:
     return await asyncio.to_thread(_get_deck_total_sync, user_id, format_, my_deck)
 
 
+def _get_deck_summary_sync(user_id: str, format_: str, my_deck):
+    """指定デッキ・フォーマットでの、そのユーザーの通算勝敗（現環境）"""
+    conn = _connect()
+    try:
+        row = conn.execute("""
+            SELECT COUNT(*) AS total, SUM(is_win) AS wins FROM matches
+            WHERE user_id = ? AND env_id = ? AND format = ? AND my_deck = ?
+        """, (user_id, CURRENT_ENV_ID, format_, my_deck)).fetchone()
+        return {"total": row["total"] or 0, "wins": row["wins"] or 0}
+    finally:
+        conn.close()
+
+
+async def get_deck_summary(user_id: str, format_: str, my_deck):
+    return await asyncio.to_thread(_get_deck_summary_sync, user_id, format_, my_deck)
+
+
+def _get_deck_recent_summary_sync(user_id: str, format_: str, my_deck, limit: int):
+    """指定デッキ・フォーマットでの、直近limit戦の勝敗（新しい順に数える）"""
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT is_win FROM matches
+            WHERE user_id = ? AND env_id = ? AND format = ? AND my_deck = ?
+            ORDER BY recorded_at DESC LIMIT ?
+        """, (user_id, CURRENT_ENV_ID, format_, my_deck, limit)).fetchall()
+        total = len(rows)
+        wins = sum(r["is_win"] for r in rows)
+        return {"total": total, "wins": wins}
+    finally:
+        conn.close()
+
+
+async def get_deck_recent_summary(user_id: str, format_: str, my_deck, limit: int = RECENT_FREE_MATCHES):
+    return await asyncio.to_thread(_get_deck_recent_summary_sync, user_id, format_, my_deck, limit)
+
+
+def _get_recent_matches_sync(user_id: str, limit: int):
+    """本人の直近の対戦履歴（デッキ・フォーマット問わず、現環境・新しい順）"""
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT format, my_deck, opp_class, opp_deck, is_first, is_win, recorded_at
+            FROM matches WHERE user_id = ? AND env_id = ?
+            ORDER BY recorded_at DESC LIMIT ?
+        """, (user_id, CURRENT_ENV_ID, limit)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def get_recent_matches(user_id: str, limit: int = 10):
+    return await asyncio.to_thread(_get_recent_matches_sync, user_id, limit)
+
+
 def _get_deck_matchups_sync(user_id: str, format_: str, my_deck):
     """指定デッキ・フォーマットでの、自分の対面別成績（相手クラスごと・現環境）"""
     conn = _connect()
@@ -1404,10 +1463,13 @@ class RepeatButton(discord.ui.Button):
 
 
 class SensekiFlowView(discord.ui.View):
-    def __init__(self, user_id: str, settings: dict):
-        super().__init__(timeout=300)
+    def __init__(self, user_id: str, settings: dict, origin_interaction: discord.Interaction):
+        # 13分。実際の対戦(5〜15分程度)をまたいで「同じ設定でもう1試合」を押せるように、
+        # 以前の5分から延長。Discordのフォローアップ編集が可能な15分に収まる範囲で設定。
+        super().__init__(timeout=780)
         self.user_id = user_id
         self.settings = settings
+        self.origin_interaction = origin_interaction
         self.opp_class = None
         self.opp_deck = None
         self.is_first = None
@@ -1485,8 +1547,18 @@ class SensekiFlowView(discord.ui.View):
         )
 
     async def on_timeout(self):
-        # メッセージ編集はできないため何もしない（ephemeralなので放置で問題なし）
-        pass
+        # 元のインタラクションのフォローアップ編集は15分まで有効。
+        # timeout=780(13分)なので基本は成功するが、念のためHTTPExceptionは握りつぶす。
+        try:
+            await self.origin_interaction.edit_original_response(
+                content=(
+                    "⏱ 入力の受付時間が終了しました。\n"
+                    "お手数ですが、パネルの「⚔️ 戦績を記録する」からもう一度お願いします。"
+                ),
+                view=None,
+            )
+        except discord.HTTPException:
+            pass
 
 
 def _resolve_grade(rank_value: str, raw_grade):
@@ -3032,7 +3104,7 @@ class SensekiCog(commands.Cog):
             )
             return
 
-        view = SensekiFlowView(str(interaction.user.id), settings)
+        view = SensekiFlowView(str(interaction.user.id), settings, interaction)
         await interaction.response.send_message(
             view.screen(
                 "相手クラスを選択してください。\n"
@@ -3326,33 +3398,79 @@ class SensekiCog(commands.Cog):
     async def _show_check(self, interaction: discord.Interaction):
         """/戦績 確認 とパネルのボタンの両方から呼ぶ"""
         settings = await get_user_settings(str(interaction.user.id))
-        lines = []
-        if settings is not None:
-            deck = settings.get("my_deck") or "デッキ未設定"
-            rank = settings.get("rank_tier") or "ランク未設定"
-            if settings.get("cr_grade"):
-                rank += f"・{settings['cr_grade']}"
-            elif settings.get("rank_tier") == GRAND_MASTER_TIER:
-                rank += "・グレードなし"
-            lines.append(f"🧑 現在の設定：**{deck}**（{settings['my_class']}） / ランク：**{rank}**")
-            lines.append("")
+        if settings is None or not settings.get("my_deck"):
+            await interaction.response.send_message(
+                "まず `/戦績 設定` で使用デッキを登録してください。", ephemeral=True
+            )
+            return
 
-        summary = await get_summary(str(interaction.user.id))
-        total = summary["total"]
-        if total == 0:
-            lines.append("まだ記録がありません。パネルの「⚔️ 戦績を記録する」から記録してみてください。")
+        format_ = settings["format"]
+        format_label = "ローテーション" if format_ == "rotation" else "アンリミテッド"
+        my_deck = settings["my_deck"]
+        rank = settings.get("rank_tier") or "ランク未設定"
+        if settings.get("cr_grade"):
+            rank += f"・{settings['cr_grade']}"
+        elif settings.get("rank_tier") == GRAND_MASTER_TIER:
+            rank += "・グレードなし"
+
+        lines = [
+            f"🧑 現在の設定：**{my_deck}**（{settings['my_class']} / {format_label}） / ランク：**{rank}**",
+            "",
+        ]
+
+        full = await get_deck_summary(str(interaction.user.id), format_, my_deck)
+        if full["total"] == 0:
+            lines.append("このデッキではまだ記録がありません。パネルの「⚔️ 戦績を記録する」から記録してみてください。")
             await interaction.response.send_message("\n".join(lines), ephemeral=True)
             return
 
-        wins = summary["wins"]
-        losses = summary["losses"]
-        win_rate = wins / total * 100
+        recent = await get_deck_recent_summary(str(interaction.user.id), format_, my_deck, RECENT_FREE_MATCHES)
+        recent_rate = recent["wins"] / recent["total"] * 100 if recent["total"] else 0
         lines.append(
-            f"📊 現在の環境での戦績\n{wins}勝{losses}敗（{total}戦）\n勝率：{win_rate:.1f}%"
+            f"📊 直近{recent['total']}戦の勝率：{recent_rate:.1f}%（{recent['wins']}勝{recent['total']-recent['wins']}敗）"
         )
+
+        if full["total"] > RECENT_FREE_MATCHES:
+            unlocked, reason, days_left = premium_access(
+                interaction.user, settings.get("started_at"), await get_state(TRIAL_CAMPAIGN_START_KEY)
+            )
+            if unlocked:
+                full_rate = full["wins"] / full["total"] * 100
+                lines.append(
+                    f"通算{full['total']}戦：勝率 {full_rate:.1f}%（{full['wins']}勝{full['total']-full['wins']}敗）"
+                )
+                if reason == "trial" and days_left <= 7:
+                    lines.append(f"🎁 無料キャンペーン期間中（あと{days_left}日で終了）")
+            else:
+                lines.append(f"通算{full['total']}戦（勝率は🔒メンバーシップ限定）")
+
         lines.append("\n対面別の弱点はパネルの「📉 弱点対面」から確認できます。")
         await log_command_usage(str(interaction.user.id), "確認")
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+
+    # ---- /戦績 履歴 ----
+    @senseki.command(name="履歴", description="直近の対戦履歴を表示します（自分の分のみ）")
+    async def recent_history_cmd(self, interaction: discord.Interaction):
+        rows = await get_recent_matches(str(interaction.user.id), 10)
+        if not rows:
+            await interaction.response.send_message(
+                "まだ記録がありません。パネルの「⚔️ 戦績を記録する」から記録してみてください。",
+                ephemeral=True,
+            )
+            return
+
+        lines = ["🕘 **直近の対戦履歴**（新しい順・最大10戦）"]
+        for r in rows:
+            result = "🟢勝ち" if r["is_win"] else "🔴負け"
+            first_second = "先攻" if r["is_first"] else "後攻"
+            fmt_label = "ローテ" if r["format"] == "rotation" else "アンリミ"
+            deck = r["my_deck"] or "デッキ未設定"
+            opp = r["opp_class"] + (f"（{r['opp_deck']}）" if r["opp_deck"] else "")
+            date = (r["recorded_at"] or "")[:16].replace("T", " ")
+            lines.append(f"・{date}　[{fmt_label}] {deck} vs {opp}　{first_second}　{result}")
+
+        await log_command_usage(str(interaction.user.id), "履歴")
+        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
 
 async def setup(bot: commands.Bot):
