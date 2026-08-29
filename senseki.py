@@ -287,7 +287,9 @@ MIN_SAMPLE_OPPDECK = 3
 MIN_SAMPLE_OPPDECK_FS = 5
 
 MIN_SAMPLE_PERSONAL = 3
-# 弱点対面ランキング（デッキ単位）：このデッキで通算これだけ戦うまではランキング非表示
+# 弱点対面ランキング（デッキ単位）：この試合数未満は「参考値」と明示して表示する
+# （以前はここに達するまで非表示にしていたが、実際のデータ量では
+#   ほぼ全員が使えない状態になったため、参考値扱いで出す方式に変更）
 DECK_RANK_MIN_MATCHES = 30
 # ②全体平均との比較（有料）：全体側の母数がこれ未満の対面は比較対象から除外
 GLOBAL_MATCHUP_MIN_SAMPLE = 10
@@ -3186,14 +3188,7 @@ class SensekiCog(commands.Cog):
         my_deck = settings["my_deck"]
 
         deck_total = await get_deck_total(str(interaction.user.id), format_, my_deck)
-        if deck_total < DECK_RANK_MIN_MATCHES:
-            await interaction.response.send_message(
-                f"**{my_deck}**（{format_label}）はまだ{deck_total}戦です。\n"
-                f"このデッキで通算{DECK_RANK_MIN_MATCHES}戦たまると弱点対面ランキングが表示されます"
-                f"（あと{DECK_RANK_MIN_MATCHES - deck_total}戦）。",
-                ephemeral=True,
-            )
-            return
+        provisional = deck_total < DECK_RANK_MIN_MATCHES
 
         rows = await get_deck_matchups(str(interaction.user.id), format_, my_deck)
         candidates = [dict(r) for r in rows if r["total"] >= MIN_SAMPLE_PERSONAL]
@@ -3209,6 +3204,11 @@ class SensekiCog(commands.Cog):
             r["win_rate"] = r["wins"] / r["total"] * 100
 
         lines = [f"📉 **{my_deck}の弱点対面**（{format_label}・現環境）"]
+        if provisional:
+            lines.append(
+                f"-# ⚠️ 参考値：このデッキはまだ{deck_total}戦です"
+                f"（{DECK_RANK_MIN_MATCHES}戦を超えると精度が安定します）"
+            )
 
         # ① 単純に勝率が低い対面（無料）
         raw_sorted = sorted(candidates, key=lambda r: r["win_rate"])
@@ -3539,6 +3539,15 @@ class SensekiCog(commands.Cog):
                 lines.append(f"通算{full['total']}戦（勝率は🔒メンバーシップ限定）")
 
         lines.append("\n対面別の弱点はパネルの「📉 弱点対面」から確認できます。")
+
+        overall = await get_summary(str(interaction.user.id))
+        if overall["total"] > full["total"]:
+            o_rate = overall["wins"] / overall["total"] * 100
+            lines.append(
+                f"-# 全デッキ通算：{overall['total']}戦"
+                f"（{overall['wins']}勝{overall['losses']}敗・勝率{o_rate:.1f}%）"
+            )
+
         await log_command_usage(str(interaction.user.id), "確認")
         await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
