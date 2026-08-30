@@ -24,9 +24,10 @@ senseki.py
     切替        登録済みから選んで切替（ランクは維持）
 
   /戦績管理（管理者のみ表示）
-    パネル設置    記録・切替・ランク更新・取消の4ボタンを常設
+    パネル設置    記録・切替・ランク更新・取消・成績確認・弱点対面の各ボタンを常設
     掲示板設置    全員の使用デッキ＆ランクの一覧を常設（設定変更時に自動更新）
     全体集計      その瞬間のDBから全体・先後別・クラス別・対面別を表示
+    環境分析画像  クラス使用率・対面マトリクス・先攻後攻をPNG画像で表示（SENSEKI_ADMIN_USER_ID本人のみ）
     データ抽出    生データ＋集計のExcelを出力（毎週月曜9:00にDMへ自動送信）
     シート同期    Googleスプレッドシートへ即時同期
     シート診断    スプレッドシート連携の設定状況
@@ -101,6 +102,7 @@ try:
     import matplotlib.pyplot as plt
     import matplotlib.font_manager as fm
     import matplotlib.colors as mcolors
+    import numpy as np  # 対面マトリクスのヒートマップ生成に使う（matplotlibの依存なので追加コストなし）
     MATPLOTLIB_IMPORT_ERROR = None
 except Exception as _e:  # ライブラリ未導入時に起動を止めない（グラフなしでテキストのみ動く）
     plt = None
@@ -298,6 +300,13 @@ SHEETS_SYNC_MINUTE = 30
 # 統計として扱える最低試合数（仕様書 8-3）
 # フェーズ3の /戦績全体 ではこの値を下回る対面は数字を出さない
 MIN_SAMPLE_FOR_STATS = 30
+
+# クラス対クラスの対面マトリクス（スプレッドシート・環境分析画像）専用のしきい値。
+# 個人の弱点対面（30戦）と違い、こちらは母数がサーバー全体の試合を
+# 7クラス×7クラス=49マスに分けるため、30戦だと当面ほぼ全マスが空欄になってしまう。
+# コミュニティ全体の「雰囲気」を見るための参考表という位置づけなので、
+# 個人向けより緩めのしきい値にしている。
+MATCHUP_MATRIX_MIN_SAMPLE = 15
 
 # 相手デッキの選択画面を出し始める、候補デッキ名の最低件数
 # 0にすると候補ゼロでも画面が出る（「分からない」しか押せない状態になる）。
@@ -1378,14 +1387,38 @@ async def get_global_summary():
 
 
 def _get_class_matchup_matrix_sync(env_id: str):
-    """現環境の、クラス対クラスの対面集計（試合数・勝数）。スプレッドシートの対面マトリクス用"""
+    """
+    現環境の、クラス対クラスの対面集計（試合数・勝数）。環境分析（Sheets・Discord画像）用。
+
+    記録は「自分のクラス」側からしか行われないため、片方向のGROUP BYだけだと
+    例えば「ロイヤル使用者がエルフと対面した記録」はあっても「エルフ使用者が
+    ロイヤルと対面した記録」がまだ無い、という非対称なマトリクスになりやすい
+    （実際、サーバー全体でもどちらかの組み合わせしか記録がない対面が多かった）。
+
+    そこで、相手側の記録も鏡写しにして合算する：
+    「my_class=X, opp_class=Y」の記録だけでなく、「my_class=Y, opp_class=X」の
+    記録も（勝敗を反転させて）Xの対Y成績としてカウントする。1試合が両クラスの
+    集計に効くので、対面ごとの母数が実質倍になり、X対YとY対Xの勝率は
+    必ず合計100%になる（同じ試合プールを両側から見ているだけなので）。
+    """
     conn = _connect()
     try:
         rows = conn.execute("""
-            SELECT my_class, opp_class, COUNT(*) AS total, SUM(is_win) AS wins
-            FROM matches WHERE env_id = ?
-            GROUP BY my_class, opp_class
-        """, (env_id,)).fetchall()
+            SELECT class_a AS my_class, class_b AS opp_class,
+                   SUM(total) AS total, SUM(wins) AS wins
+            FROM (
+                SELECT my_class AS class_a, opp_class AS class_b,
+                       COUNT(*) AS total, SUM(is_win) AS wins
+                FROM matches WHERE env_id = ?
+                GROUP BY my_class, opp_class
+                UNION ALL
+                SELECT opp_class AS class_a, my_class AS class_b,
+                       COUNT(*) AS total, SUM(1 - is_win) AS wins
+                FROM matches WHERE env_id = ?
+                GROUP BY my_class, opp_class
+            ) t
+            GROUP BY class_a, class_b
+        """, (env_id, env_id)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -1393,6 +1426,36 @@ def _get_class_matchup_matrix_sync(env_id: str):
 
 async def get_class_matchup_matrix(env_id: str = None):
     return await asyncio.to_thread(_get_class_matchup_matrix_sync, env_id or CURRENT_ENV_ID)
+
+
+def combine_symmetric_class_stats(by_my_class: list, by_opp_class: list) -> list:
+    """
+    クラス別の試合数・勝数を、自分側の記録と相手側の記録の両方から合算する。
+
+    by_my_class は「自分がそのクラスを使ったときの成績」、by_opp_class は
+    「そのクラスを相手にしたときの、自分の勝敗」（＝相手クラスの成績を裏返したもの）。
+    これらを合算すると、自分がそのクラスを使った試合と、相手がそのクラスを
+    使った試合の両方が「そのクラスの成績」としてカウントされる。
+
+    例：ロイヤルを使う人が少なくても、ロイヤルと対面した人は多ければ、
+    後者の記録（を裏返したもの）からロイヤルの勝率が見えるようになる。
+    """
+    totals: dict = {}
+    wins: dict = {}
+    for r in by_my_class:
+        c = r["my_class"]
+        totals[c] = totals.get(c, 0) + r["total"]
+        wins[c] = wins.get(c, 0) + (r["wins"] or 0)
+    for r in by_opp_class:
+        c = r["opp_class"]
+        total = r["total"]
+        opp_wins = total - (r["wins"] or 0)  # 自分が負けた試合数＝相手クラスの勝数
+        totals[c] = totals.get(c, 0) + total
+        wins[c] = wins.get(c, 0) + opp_wins
+    return [
+        {"my_class": c, "total": totals[c], "wins": wins[c]}
+        for c in sorted(totals, key=lambda k: -totals[k])
+    ]
 
 
 # ==============================
@@ -2610,11 +2673,16 @@ class SensekiCog(commands.Cog):
         matches = await fetch_all_matches(env_only=False)
         global_summary = await get_global_summary()
         matchup_rows = await get_class_matchup_matrix()
+        # クラス別集計は「自分が使った試合」と「相手として対面した試合」の両方を
+        # 合算した対称版を使う（詳しくは combine_symmetric_class_stats のdocstring参照）
+        class_summary = combine_symmetric_class_stats(
+            global_summary["by_my_class"], global_summary["by_opp_class"]
+        )
         return await asyncio.to_thread(
             senseki_sheets.sync_to_sheets,
             matches, FORMAT_LABELS, self._name_resolver(),
-            global_summary["by_my_class"], global_summary["by_first"],
-            matchup_rows, CLASS_CHOICES, MIN_SAMPLE_FOR_STATS, CURRENT_ENV_ID,
+            class_summary, global_summary["by_first"],
+            matchup_rows, CLASS_CHOICES, MATCHUP_MATRIX_MIN_SAMPLE, CURRENT_ENV_ID,
         )
 
     @tasks.loop(time=dtime(hour=SHEETS_SYNC_HOUR, minute=SHEETS_SYNC_MINUTE, tzinfo=JST))
@@ -3030,6 +3098,13 @@ class SensekiCog(commands.Cog):
         )
         await interaction.response.send_message("\n".join(lines), ephemeral=True)
 
+    @admin.command(
+        name="環境分析画像",
+        description="現環境のクラス使用率・対面マトリクス・先攻後攻をPNG画像で表示します（管理者本人のみ）",
+    )
+    async def senseki_global_image(self, interaction: discord.Interaction):
+        await self._show_global_analysis(interaction)
+
     # ---- /デッキ登録 ----
     @deck.command(name="登録", description="よく使うデッキを登録しておきます（複数登録できます）")
     @app_commands.describe(
@@ -3297,6 +3372,228 @@ class SensekiCog(commands.Cog):
                                            deck_total: int = None, min_matches: int = None):
         return await asyncio.to_thread(
             self._render_weak_matchups_chart_sync, my_deck, format_label, rows, deck_total, min_matches
+        )
+
+    # ---- 環境分析（サーバー全体・現環境）のグラフ ----
+    # スプレッドシートの「クラス別集計」「対面マトリクス」「先攻後攻集計」と同じ集計を、
+    # PNG画像としてDiscord上でいつでも見られるようにするためのもの。
+    # 個人の弱点対面と違い母数が母集団全体なので誰でも使ってよい機能という位置づけ。
+
+    def _render_class_summary_image_sync(self, class_summary: list, env_id: str):
+        """クラス使用率（円）＋クラス別勝率（横棒）を1枚のPNGにする"""
+        if plt is None or _JP_FONT_NAME is None or not class_summary:
+            return None
+        try:
+            rows = sorted(class_summary, key=lambda r: r["total"], reverse=True)
+            labels = [r["my_class"] for r in rows]
+            totals = [r["total"] for r in rows]
+            win_rates = [
+                (r["wins"] or 0) / r["total"] * 100 if r["total"] else 0.0 for r in rows
+            ]
+
+            norm = mcolors.Normalize(vmin=0, vmax=100)
+            cmap = matplotlib.colormaps["RdYlGn"]
+
+            fig, (ax_pie, ax_bar) = plt.subplots(
+                2, 1, figsize=(7.4, 9.6), dpi=150,
+                gridspec_kw={"height_ratios": [1, 1.1]},
+            )
+
+            ax_pie.pie(totals, labels=labels, autopct="%1.1f%%", startangle=90,
+                       textprops={"fontsize": 11})
+            ax_pie.set_title(f"クラス使用率（現環境：{env_id}）", fontsize=14, pad=12)
+
+            # 勝率バーは勝率の低い順（悪い順）に並べ、悪目立ちする対面を上に来させる
+            bar_order = sorted(range(len(rows)), key=lambda i: win_rates[i], reverse=True)
+            bar_labels = [labels[i] for i in bar_order]
+            bar_values = [win_rates[i] for i in bar_order]
+            bar_totals = [totals[i] for i in bar_order]
+            colors = [cmap(norm(v)) for v in bar_values]
+
+            y = range(len(bar_labels))
+            ax_bar.barh(y, bar_values, color=colors, edgecolor="#333333", linewidth=0.5, height=0.65)
+            ax_bar.set_yticks(list(y))
+            ax_bar.set_yticklabels(bar_labels, fontsize=12)
+            ax_bar.set_xlim(0, 118)
+            ax_bar.set_xticks([0, 20, 40, 60, 80, 100])
+            ax_bar.axvline(50, color="#888888", linestyle="--", linewidth=1)
+            ax_bar.set_xlabel("勝率（%）", fontsize=11)
+            for yi, (v, t) in enumerate(zip(bar_values, bar_totals)):
+                ax_bar.text(v + 2, yi, f"{v:.1f}%（{t}戦）", va="center", ha="left", fontsize=10)
+            ax_bar.set_title(f"クラス別勝率（現環境：{env_id}）", fontsize=14, pad=12)
+            ax_bar.spines["top"].set_visible(False)
+            ax_bar.spines["right"].set_visible(False)
+
+            fig.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png")
+            plt.close(fig)
+            buf.seek(0)
+            return buf
+        except Exception:
+            return None
+
+    def _render_matchup_heatmap_sync(self, matchup_rows: list, classes: list,
+                                      min_sample: int, env_id: str):
+        """クラス対クラスの対面マトリクスをヒートマップのPNGにする。
+        母数がしきい値未満のマスはグレーにして、件数だけ小さく添える
+        （空欄にしてしまうと"データがない"のか"信頼できないだけ"なのか区別できないため）。
+        """
+        if plt is None or _JP_FONT_NAME is None or not matchup_rows:
+            return None
+        try:
+            lookup = {(r["my_class"], r["opp_class"]): r for r in matchup_rows}
+            n = len(classes)
+            rate_grid = [[None] * n for _ in range(n)]
+            total_grid = [[0] * n for _ in range(n)]
+            for i, mc in enumerate(classes):
+                for j, oc in enumerate(classes):
+                    r = lookup.get((mc, oc))
+                    total = r["total"] if r else 0
+                    wins = r["wins"] if r else 0
+                    total_grid[i][j] = total
+                    rate_grid[i][j] = (wins / total * 100) if total >= min_sample else None
+
+            display_grid = np.full((n, n), np.nan)
+            for i in range(n):
+                for j in range(n):
+                    if rate_grid[i][j] is not None:
+                        display_grid[i, j] = rate_grid[i][j]
+
+            cmap = matplotlib.colormaps["RdYlGn"].copy()
+            cmap.set_bad(color="#d9d9d9")  # 母数不足のマス
+
+            fig, ax = plt.subplots(figsize=(8.2, 7.4), dpi=150)
+            im = ax.imshow(display_grid, cmap=cmap, vmin=0, vmax=100, aspect="equal")
+
+            ax.set_xticks(range(n))
+            ax.set_xticklabels(classes, fontsize=11, rotation=30, ha="right")
+            ax.set_yticks(range(n))
+            ax.set_yticklabels(classes, fontsize=11)
+            ax.set_xlabel("相手のクラス", fontsize=11)
+            ax.set_ylabel("自分のクラス", fontsize=11)
+
+            for i in range(n):
+                for j in range(n):
+                    total = total_grid[i][j]
+                    rate = rate_grid[i][j]
+                    if rate is not None:
+                        text = f"{rate:.0f}%\n({total})"
+                        color = "#1a1a1a" if 25 <= rate <= 75 else "white"
+                    elif total > 0:
+                        text = f"({total})"
+                        color = "#555555"
+                    else:
+                        text = "-"
+                        color = "#999999"
+                    ax.text(j, i, text, ha="center", va="center", fontsize=9, color=color)
+
+            ax.set_title(f"対面マトリクス（現環境：{env_id}）", fontsize=14, pad=14)
+            fig.colorbar(im, ax=ax, label="勝率（%）", fraction=0.046, pad=0.04)
+            fig.text(
+                0.5, 0.005,
+                f"グレーのマスは対戦数が{min_sample}戦未満（参考値扱い）。カッコ内は対戦数。",
+                ha="center", fontsize=9, color="#666666",
+            )
+            fig.tight_layout(rect=[0, 0.02, 1, 1])
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png")
+            plt.close(fig)
+            buf.seek(0)
+            return buf
+        except Exception:
+            return None
+
+    def _render_first_second_image_sync(self, first_second_summary: list, env_id: str):
+        """先攻/後攻の勝率を横棒2本のPNGにする"""
+        if plt is None or _JP_FONT_NAME is None or not first_second_summary:
+            return None
+        try:
+            by_first = {r["is_first"]: r for r in first_second_summary}
+            order = [(1, "先攻"), (0, "後攻")]
+            labels, values, totals = [], [], []
+            for key, label in order:
+                r = by_first.get(key)
+                if r is None:
+                    continue
+                labels.append(label)
+                totals.append(r["total"])
+                values.append((r["wins"] or 0) / r["total"] * 100 if r["total"] else 0.0)
+
+            norm = mcolors.Normalize(vmin=0, vmax=100)
+            cmap = matplotlib.colormaps["RdYlGn"]
+            colors = [cmap(norm(v)) for v in values]
+
+            fig, ax = plt.subplots(figsize=(5.6, 3.6), dpi=150)
+            y = range(len(labels))
+            ax.barh(y, values, color=colors, edgecolor="#333333", linewidth=0.5, height=0.55)
+            ax.set_yticks(list(y))
+            ax.set_yticklabels(labels, fontsize=12)
+            ax.set_xlim(0, 118)
+            ax.set_xticks([0, 20, 40, 60, 80, 100])
+            ax.axvline(50, color="#888888", linestyle="--", linewidth=1)
+            ax.set_xlabel("勝率（%）", fontsize=11)
+            for yi, (v, t) in enumerate(zip(values, totals)):
+                ax.text(v + 2, yi, f"{v:.1f}%（{t}戦）", va="center", ha="left", fontsize=10)
+            ax.set_title(f"先攻/後攻の勝率（現環境：{env_id}）", fontsize=13, pad=12)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            fig.tight_layout()
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png")
+            plt.close(fig)
+            buf.seek(0)
+            return buf
+        except Exception:
+            return None
+
+    async def _show_global_analysis(self, interaction: discord.Interaction):
+        """環境分析コマンドの本体。SENSEKI_ADMIN_USER_ID 本人のみ実行できる"""
+        if interaction.user.id != SENSEKI_ADMIN_USER_ID:
+            await interaction.response.send_message(
+                "このコマンドは管理者専用です。", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        g = await get_global_summary()
+        if g["total"] == 0:
+            await interaction.followup.send("まだ記録がありません。", ephemeral=True)
+            return
+        matchup_rows = await get_class_matchup_matrix()
+        # クラス別集計はSheets同期側と同じく、自分が使った試合＋相手として対面した試合の対称合算
+        class_summary = combine_symmetric_class_stats(g["by_my_class"], g["by_opp_class"])
+
+        images = await asyncio.gather(
+            asyncio.to_thread(self._render_class_summary_image_sync, class_summary, CURRENT_ENV_ID),
+            asyncio.to_thread(
+                self._render_matchup_heatmap_sync, matchup_rows, CLASS_CHOICES,
+                MATCHUP_MATRIX_MIN_SAMPLE, CURRENT_ENV_ID,
+            ),
+            asyncio.to_thread(self._render_first_second_image_sync, g["by_first"], CURRENT_ENV_ID),
+        )
+        files = [
+            discord.File(buf, filename=name)
+            for buf, name in zip(images, ["クラス別集計.png", "対面マトリクス.png", "先攻後攻集計.png"])
+            if buf is not None
+        ]
+
+        await log_command_usage(str(interaction.user.id), "環境分析")
+
+        if not files:
+            await interaction.followup.send(
+                "画像の生成に失敗しました（グラフ機能が無効になっている可能性があります。"
+                "`/戦績管理 診断` を確認してください）。",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            f"📊 **現環境（{CURRENT_ENV_ID}）の全体分析**（{g['total']}戦・記録者{g['users']}名）",
+            files=files,
+            ephemeral=True,
         )
 
     # ---- /弱点対面 ----
