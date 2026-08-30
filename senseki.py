@@ -95,6 +95,36 @@ except Exception as _e:  # モジュール未配置でも起動を止めない
     senseki_sheets = None
     SHEETS_MODULE_ERROR = f"{type(_e).__name__}: {_e}"
 
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # Railwayに画面がないためGUIバックエンドは使わない
+    import matplotlib.pyplot as plt
+    import matplotlib.font_manager as fm
+    import matplotlib.colors as mcolors
+    MATPLOTLIB_IMPORT_ERROR = None
+except Exception as _e:  # ライブラリ未導入時に起動を止めない（グラフなしでテキストのみ動く）
+    plt = None
+    MATPLOTLIB_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
+
+# ---- 弱点対面グラフ用の日本語フォント ----
+# assets/NotoSansJP-Regular.otf を同梱（Noto Sans CJK JPのJapaneseサブセット・OFLライセンス）。
+# matplotlibは標準で日本語グリフを持たないため、明示的にフォントファイルを読み込む。
+# フォントが無い/読み込み失敗した場合は _JP_FONT_NAME が None のままとなり、
+# グラフ生成自体をスキップしてテキストのみ送る（デグレードするが起動は止めない）。
+_JP_FONT_NAME = None
+if plt is not None:
+    try:
+        _FONT_PATH = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "assets", "NotoSansJP-Regular.otf"
+        )
+        if os.path.exists(_FONT_PATH):
+            fm.fontManager.addfont(_FONT_PATH)
+            _JP_FONT_NAME = fm.FontProperties(fname=_FONT_PATH).get_name()
+            matplotlib.rcParams["font.family"] = _JP_FONT_NAME
+            matplotlib.rcParams["axes.unicode_minus"] = False
+    except Exception:
+        _JP_FONT_NAME = None
+
 # ==============================
 # 設定
 # ==============================
@@ -1347,6 +1377,24 @@ async def get_global_summary():
     return await asyncio.to_thread(_get_global_summary_sync)
 
 
+def _get_class_matchup_matrix_sync(env_id: str):
+    """現環境の、クラス対クラスの対面集計（試合数・勝数）。スプレッドシートの対面マトリクス用"""
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT my_class, opp_class, COUNT(*) AS total, SUM(is_win) AS wins
+            FROM matches WHERE env_id = ?
+            GROUP BY my_class, opp_class
+        """, (env_id,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def get_class_matchup_matrix(env_id: str = None):
+    return await asyncio.to_thread(_get_class_matchup_matrix_sync, env_id or CURRENT_ENV_ID)
+
+
 # ==============================
 # /戦績 のボタン形式フロー
 # ==============================
@@ -2560,8 +2608,13 @@ class SensekiCog(commands.Cog):
 
     async def _run_sheets_sync(self) -> dict:
         matches = await fetch_all_matches(env_only=False)
+        global_summary = await get_global_summary()
+        matchup_rows = await get_class_matchup_matrix()
         return await asyncio.to_thread(
-            senseki_sheets.sync_to_sheets, matches, FORMAT_LABELS, self._name_resolver()
+            senseki_sheets.sync_to_sheets,
+            matches, FORMAT_LABELS, self._name_resolver(),
+            global_summary["by_my_class"], global_summary["by_first"],
+            matchup_rows, CLASS_CHOICES, MIN_SAMPLE_FOR_STATS, CURRENT_ENV_ID,
         )
 
     @tasks.loop(time=dtime(hour=SHEETS_SYNC_HOUR, minute=SHEETS_SYNC_MINUTE, tzinfo=JST))
@@ -2571,6 +2624,8 @@ class SensekiCog(commands.Cog):
         try:
             result = await self._run_sheets_sync()
             print(f"✅ 戦績スプレッドシート同期完了: {result['raw']}件 / {result['users']}名")
+            for w in result.get("warnings", []):
+                print(f"⚠️ 戦績スプレッドシート同期の一部が失敗: {w}")
         except Exception as e:
             print(f"⚠️ 戦績スプレッドシート同期に失敗しました: {type(e).__name__}: {e}")
 
@@ -2586,7 +2641,9 @@ class SensekiCog(commands.Cog):
         if not take_dirty():
             return  # 変更がなければAPIを呼ばない
         try:
-            await self._run_sheets_sync()
+            result = await self._run_sheets_sync()
+            for w in result.get("warnings", []):
+                print(f"⚠️ 戦績スプレッドシートの自動同期の一部が失敗: {w}")
         except Exception as e:
             print(f"⚠️ 戦績スプレッドシートの自動同期に失敗しました: {type(e).__name__}: {e}")
             mark_dirty()  # 次の周回で再試行する
@@ -2617,7 +2674,12 @@ class SensekiCog(commands.Cog):
         try:
             result = await self._run_sheets_sync()
             await interaction.followup.send(
-                f"✅ 同期しました（{result['raw']}件 / {result['users']}名）\n{result['url']}",
+                f"✅ 同期しました（{result['raw']}件 / {result['users']}名）\n{result['url']}"
+                + (
+                    "\n\n⚠️ 一部の追加処理が失敗しました（データ自体は同期済みです）：\n"
+                    + "\n".join(f"- {w}" for w in result["warnings"])
+                    if result.get("warnings") else ""
+                ),
                 ephemeral=True,
             )
         except Exception as e:
@@ -2802,6 +2864,12 @@ class SensekiCog(commands.Cog):
         persistent = _is_persistent(os.path.dirname(DB_PATH))
         body = describe_storage()
         body += f"\n\n記録件数: {counts['matches']}件\n設定済みユーザー: {counts['users']}名"
+        if MATPLOTLIB_IMPORT_ERROR:
+            body += f"\n\nグラフ機能: 無効（matplotlib未導入）\n  {MATPLOTLIB_IMPORT_ERROR}"
+        elif _JP_FONT_NAME is None:
+            body += "\n\nグラフ機能: 無効（日本語フォント未検出。assets/NotoSansJP-Regular.otf を配置してください）"
+        else:
+            body += f"\n\nグラフ機能: 有効（フォント: {_JP_FONT_NAME}）"
         warn = ""
         if not persistent:
             warn = (
@@ -3171,6 +3239,66 @@ class SensekiCog(commands.Cog):
             ephemeral=True,
         )
 
+    # ---- /弱点対面 のグラフ（①のみ・無料枠） ----
+    def _render_weak_matchups_chart_sync(self, my_deck: str, format_label: str, rows: list,
+                                          deck_total: int = None, min_matches: int = None):
+        """①勝率が低い対面を横棒グラフのPNGにする。フォント未導入などの場合はNoneを返す"""
+        if plt is None or _JP_FONT_NAME is None or not rows:
+            return None
+        try:
+            # 勝率の高い順に並べる → barhは先頭が下から積まれるので、
+            # 一番勝率が低い（＝弱点として一番目立たせたい）対面が一番上に来る
+            ordered = sorted(rows, key=lambda r: r["win_rate"], reverse=True)
+            labels = [r["opp_class"] for r in ordered]
+            values = [r["win_rate"] for r in ordered]
+
+            norm = mcolors.Normalize(vmin=0, vmax=100)
+            cmap = matplotlib.colormaps["RdYlGn"]
+            colors = [cmap(norm(v)) for v in values]
+
+            height = max(2.2, 0.55 * len(ordered) + 1.2)
+            fig, ax = plt.subplots(figsize=(7.8, height), dpi=150)
+
+            y = range(len(ordered))
+            ax.barh(y, values, color=colors, edgecolor="#333333", linewidth=0.5, height=0.65)
+            ax.set_yticks(list(y))
+            ax.set_yticklabels(labels, fontsize=12)
+            ax.set_xlim(0, 118)  # 100%のバーでも右側にラベル分の余白を確保
+            ax.set_xticks([0, 20, 40, 60, 80, 100])
+            ax.axvline(50, color="#888888", linestyle="--", linewidth=1)
+            ax.set_xlabel("勝率（%）", fontsize=11)
+
+            for yi, r in zip(y, ordered):
+                losses = r["total"] - r["wins"]
+                text = f"{r['win_rate']:.1f}%（{r['wins']}勝{losses}敗・{r['total']}戦）"
+                ax.text(r["win_rate"] + 2, yi, text, va="center", ha="left", fontsize=10, color="#222222")
+
+            ax.set_title(f"{my_deck}の弱点対面（{format_label}）", fontsize=14, pad=14)
+            if deck_total is not None and min_matches is not None and deck_total < min_matches:
+                ax.text(
+                    0.5, 1.14,
+                    f"⚠ 参考値：まだ{deck_total}戦です（{min_matches}戦を超えると精度が安定します）",
+                    transform=ax.transAxes, ha="center", va="bottom", fontsize=10.5, color="#b5651d",
+                )
+
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
+            fig.tight_layout()
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png")
+            plt.close(fig)
+            buf.seek(0)
+            return buf
+        except Exception:
+            return None
+
+    async def _render_weak_matchups_chart(self, my_deck: str, format_label: str, rows: list,
+                                           deck_total: int = None, min_matches: int = None):
+        return await asyncio.to_thread(
+            self._render_weak_matchups_chart_sync, my_deck, format_label, rows, deck_total, min_matches
+        )
+
     # ---- /弱点対面 ----
     # SENSEKI_MEMBERS_ONLY が true になるまで①②とも誰でも使える（コマンド自体の公開範囲）。
     # ②（全体平均との比較）は premium_access() で個別に判定：
@@ -3274,8 +3402,18 @@ class SensekiCog(commands.Cog):
         lines.append(
             f"\n-# 対面ごとに{MIN_SAMPLE_PERSONAL}戦、全体比較は全体側{GLOBAL_MATCHUP_MIN_SAMPLE}戦以上のものだけ表示しています。"
         )
+
+        # グラフは①（無料枠）の全対面を対象にする。フォント未導入時などはNoneが返り、
+        # そのままテキストのみで送信される（グラフなしでも壊れない）。
+        chart_buf = await self._render_weak_matchups_chart(
+            my_deck, format_label, candidates, deck_total=deck_total, min_matches=DECK_RANK_MIN_MATCHES
+        )
+        file_ = discord.File(chart_buf, filename="weak_matchups.png") if chart_buf else None
+
         await log_command_usage(str(interaction.user.id), "弱点対面")
-        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
+        await interaction.response.send_message(
+            "\n".join(lines)[:1900], file=file_, ephemeral=True
+        )
 
     @senseki.command(name="弱点対面", description="対面別の勝率が低い相手と、おすすめの攻略記事を表示します")
     async def weak_matchups(self, interaction: discord.Interaction):
