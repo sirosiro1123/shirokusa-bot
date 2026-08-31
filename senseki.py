@@ -22,9 +22,11 @@ senseki.py
   /デッキ
     登録        よく使うデッキを登録（複数可）
     切替        登録済みから選んで切替（ランクは維持）
+    検証開始／検証終了／検証集計  個人用デッキバリアント（下記）の管理者フォールバック。
+                通常はパネルの「🧪 デッキ検証」ボタンから使う
 
   /戦績管理（管理者のみ表示）
-    パネル設置    記録・切替・ランク更新・取消・成績確認・弱点対面の各ボタンを常設
+    パネル設置    記録・切替・ランク更新・取消・成績確認・弱点対面・デッキ検証の各ボタンを常設
     掲示板設置    全員の使用デッキ＆ランクの一覧を常設（設定変更時に自動更新）
     全体集計      その瞬間のDBから全体・先後別・クラス別・対面別を表示
     環境分析画像  クラス使用率・対面マトリクス・先攻後攻をPNG画像で表示（SENSEKI_ADMIN_USER_ID本人のみ）
@@ -540,6 +542,36 @@ def _init_db_sync():
             """)
 
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS personal_deck_variants (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                variant_label TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS user_variant_state (
+                user_id TEXT NOT NULL,
+                format TEXT NOT NULL,
+                my_class TEXT NOT NULL,
+                my_deck TEXT NOT NULL,
+                variant_label TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, format, my_class, my_deck)
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_personal_variant_user "
+            "ON personal_deck_variants(user_id, variant_label)"
+        )
+        # 1試合につきタグは1つまで（同じ試合に二重で紐付けようとしたら弾く）
+        cur.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_personal_variant_match "
+            "ON personal_deck_variants(match_id)"
+        )
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS guide_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 my_class TEXT NOT NULL DEFAULT '',
@@ -645,7 +677,7 @@ def _insert_match_sync(user_id: str, settings: dict, opp_class: str, opp_deck,
     conn = _connect()
     try:
         now = datetime.now(JST).isoformat()
-        conn.execute("""
+        cur = conn.execute("""
             INSERT INTO matches (
                 user_id, recorded_at, env_id, format, my_class, my_deck, rank_tier, cr_grade,
                 opp_class, opp_deck, is_first, is_win
@@ -655,20 +687,23 @@ def _insert_match_sync(user_id: str, settings: dict, opp_class: str, opp_deck,
             settings.get("my_deck"), settings.get("rank_tier"), settings.get("cr_grade"),
             opp_class, opp_deck, 1 if is_first else 0, 1 if is_win else 0,
         ))
+        match_id = cur.lastrowid
         # 自分のデッキ・相手のデッキの両方を候補プールに貯める
         _register_deck_name(conn, settings["my_class"], settings.get("my_deck"))
         _register_deck_name(conn, opp_class, opp_deck)
         conn.commit()
+        return match_id
     finally:
         conn.close()
 
 
 async def insert_match(user_id: str, settings: dict, opp_class: str, opp_deck,
                        is_first: bool, is_win: bool):
-    await asyncio.to_thread(
+    match_id = await asyncio.to_thread(
         _insert_match_sync, user_id, settings, opp_class, opp_deck, is_first, is_win
     )
     mark_dirty()
+    return match_id
 
 
 def _get_deck_names_sync(class_name: str, limit: int = 20):
@@ -908,6 +943,7 @@ def _delete_last_match_sync(user_id: str):
         if row is None:
             return None
         conn.execute("DELETE FROM matches WHERE id = ?", (row["id"],))
+        conn.execute("DELETE FROM personal_deck_variants WHERE match_id = ?", (row["id"],))
         conn.commit()
         return dict(row)
     finally:
@@ -919,6 +955,108 @@ async def delete_last_match(user_id: str):
     if result is not None:
         mark_dirty()
     return result
+
+
+# ---- 個人用デッキバリアント（検証タグ） ----
+# 生データ（matches.my_deck）は一切変更しない。共有集計（環境デッキ分布・対面マトリクス等）は
+# personal_deck_variants / user_variant_state のどちらのテーブルも参照しないので、
+# ここで何をしてもデッキ名の表記ゆれ対策や公開集計には影響しない。
+
+def _get_active_variant_sync(user_id: str, format_: str, my_class: str, my_deck: str):
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT variant_label FROM user_variant_state "
+            "WHERE user_id = ? AND format = ? AND my_class = ? AND my_deck = ?",
+            (user_id, format_, my_class, my_deck),
+        ).fetchone()
+        return row["variant_label"] if row else None
+    finally:
+        conn.close()
+
+
+async def get_active_variant(user_id: str, format_: str, my_class: str, my_deck: str):
+    if not my_deck:
+        return None
+    return await asyncio.to_thread(_get_active_variant_sync, user_id, format_, my_class, my_deck)
+
+
+def _set_active_variant_sync(user_id: str, format_: str, my_class: str, my_deck: str, variant_label: str):
+    conn = _connect()
+    try:
+        now = datetime.now(JST).isoformat()
+        conn.execute("""
+            INSERT INTO user_variant_state (user_id, format, my_class, my_deck, variant_label, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, format, my_class, my_deck) DO UPDATE SET
+                variant_label = excluded.variant_label,
+                updated_at = excluded.updated_at
+        """, (user_id, format_, my_class, my_deck, variant_label, now))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def set_active_variant(user_id: str, format_: str, my_class: str, my_deck: str, variant_label: str):
+    await asyncio.to_thread(_set_active_variant_sync, user_id, format_, my_class, my_deck, variant_label)
+
+
+def _clear_active_variant_sync(user_id: str, format_: str, my_class: str, my_deck: str) -> bool:
+    conn = _connect()
+    try:
+        cur = conn.execute(
+            "DELETE FROM user_variant_state "
+            "WHERE user_id = ? AND format = ? AND my_class = ? AND my_deck = ?",
+            (user_id, format_, my_class, my_deck),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+async def clear_active_variant(user_id: str, format_: str, my_class: str, my_deck: str) -> bool:
+    return await asyncio.to_thread(_clear_active_variant_sync, user_id, format_, my_class, my_deck)
+
+
+def _insert_personal_variant_sync(match_id: int, user_id: str, variant_label: str):
+    conn = _connect()
+    try:
+        now = datetime.now(JST).isoformat()
+        conn.execute(
+            "INSERT INTO personal_deck_variants (match_id, user_id, variant_label, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (match_id, user_id, variant_label, now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def insert_personal_variant(match_id: int, user_id: str, variant_label: str):
+    await asyncio.to_thread(_insert_personal_variant_sync, match_id, user_id, variant_label)
+
+
+def _get_variant_summary_sync(user_id: str, format_: str, my_class: str, my_deck: str):
+    conn = _connect()
+    try:
+        rows = conn.execute("""
+            SELECT v.variant_label AS variant_label,
+                   COUNT(*) AS total,
+                   SUM(m.is_win) AS wins
+            FROM personal_deck_variants v
+            JOIN matches m ON m.id = v.match_id
+            WHERE v.user_id = ? AND m.format = ? AND m.my_class = ? AND m.my_deck = ?
+            GROUP BY v.variant_label
+            ORDER BY total DESC
+        """, (user_id, format_, my_class, my_deck)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def get_variant_summary(user_id: str, format_: str, my_class: str, my_deck: str):
+    return await asyncio.to_thread(_get_variant_summary_sync, user_id, format_, my_class, my_deck)
 
 
 def _get_summary_sync(user_id: str):
@@ -1678,16 +1816,24 @@ class SensekiFlowView(discord.ui.View):
         self.add_item(OpponentClassSelect())
 
     async def finalize(self, interaction: discord.Interaction, is_win: bool):
-        await insert_match(
+        match_id = await insert_match(
             self.user_id, self.settings, self.opp_class, self.opp_deck,
             self.is_first, is_win,
         )
+        variant_label = await get_active_variant(
+            self.user_id, self.settings["format"], self.settings["my_class"],
+            self.settings.get("my_deck"),
+        )
+        if variant_label:
+            await insert_personal_variant(match_id, self.user_id, variant_label)
+
         result_label = "勝ち" if is_win else "負け"
         self.clear_items()
         self.add_item(RepeatButton())
+        tag_note = f"\n🏷 検証タグ「{variant_label}」を付けて記録しました。" if variant_label else ""
         await interaction.response.edit_message(
             content=self.screen(
-                f"✅ **{result_label}** で記録しました。\n"
+                f"✅ **{result_label}** で記録しました。{tag_note}\n"
                 f"続けて記録する場合は下のボタンを押してください。"
             ),
             view=self,
@@ -2328,6 +2474,136 @@ class PanelWeakButton(discord.ui.Button):
         await cog._show_weak_matchups(interaction)
 
 
+PANEL_VARIANT_CUSTOM_ID = "senseki_panel_variant_v1"
+
+
+class VariantTagModal(discord.ui.Modal, title="検証タグを設定"):
+    tag_name = discord.ui.TextInput(
+        label="タグ名",
+        placeholder="例：アンテマリア採用型、フルスペル型 など",
+        required=True,
+        max_length=50,
+    )
+
+    def __init__(self, settings: dict):
+        super().__init__()
+        self.settings = settings
+
+    async def on_submit(self, interaction: discord.Interaction):
+        label = str(self.tag_name.value).strip()
+        if not label:
+            await interaction.response.send_message("タグ名を入力してください。", ephemeral=True)
+            return
+        await set_active_variant(
+            str(interaction.user.id), self.settings["format"], self.settings["my_class"],
+            self.settings["my_deck"], label,
+        )
+        await interaction.response.send_message(
+            f"🏷 検証タグ「{label}」を開始しました。\n"
+            f"これ以降、**{self.settings['my_deck']}**で記録する対戦に自動で付与されます"
+            f"（この記録はあなたにしか見えません）。\n"
+            f"やめる場合はもう一度「🧪 デッキ検証」→「タグを解除」を押してください。",
+            ephemeral=True,
+        )
+
+
+class VariantSetButton(discord.ui.Button):
+    def __init__(self, settings: dict):
+        self.settings = settings
+        super().__init__(label="タグを設定・変更", style=discord.ButtonStyle.primary)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(VariantTagModal(self.settings))
+
+
+class VariantClearButton(discord.ui.Button):
+    def __init__(self, settings: dict):
+        self.settings = settings
+        super().__init__(label="タグを解除", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        ok = await clear_active_variant(
+            str(interaction.user.id), self.settings["format"], self.settings["my_class"],
+            self.settings["my_deck"],
+        )
+        if ok:
+            msg = "🏷 検証タグを解除しました。以降の記録は通常通りタグなしで残ります。"
+        else:
+            msg = "現在、有効な検証タグはありません。"
+        await interaction.response.edit_message(content=msg, view=None)
+
+
+class VariantSummaryButton(discord.ui.Button):
+    def __init__(self, settings: dict):
+        self.settings = settings
+        super().__init__(label="集計を見る", style=discord.ButtonStyle.secondary)
+
+    async def callback(self, interaction: discord.Interaction):
+        rows = await get_variant_summary(
+            str(interaction.user.id), self.settings["format"], self.settings["my_class"],
+            self.settings["my_deck"],
+        )
+        if not rows:
+            await interaction.response.edit_message(
+                content=(
+                    f"**{self.settings['my_deck']}**にはまだ検証タグ付きの記録がありません。\n"
+                    f"「タグを設定・変更」からタグを付けてから対戦を記録してください。"
+                ),
+                view=None,
+            )
+            return
+        active = await get_active_variant(
+            str(interaction.user.id), self.settings["format"], self.settings["my_class"],
+            self.settings["my_deck"],
+        )
+        lines = [f"🧪 **{self.settings['my_deck']}** 個人検証タグ別勝率（あなただけに表示）"]
+        for r in rows:
+            total = r["total"]
+            wins = r["wins"] or 0
+            rate = wins / total * 100 if total else 0
+            mark = " ▶️稼働中" if active and r["variant_label"] == active else ""
+            lines.append(
+                f"・**{r['variant_label']}**：勝率 {rate:.1f}%"
+                f"（{wins}勝{total - wins}敗・{total}戦）{mark}"
+            )
+        lines.append("-# この集計は生データ（デッキ名）には反映されません。あなただけが見られます。")
+        await interaction.response.edit_message(content="\n".join(lines)[:1900], view=None)
+
+
+class PanelVariantButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="デッキ検証",
+            style=discord.ButtonStyle.secondary,
+            emoji="🧪",
+            custom_id=PANEL_VARIANT_CUSTOM_ID,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        settings = await get_user_settings(str(interaction.user.id))
+        if settings is None or not settings.get("my_deck"):
+            await interaction.response.send_message(
+                "まず「🆕 初回設定」か「🔄 デッキ切替」でデッキを登録してください。",
+                ephemeral=True,
+            )
+            return
+        active = await get_active_variant(
+            str(interaction.user.id), settings["format"], settings["my_class"], settings["my_deck"]
+        )
+        active_note = f"\n現在のタグ：**{active}**" if active else "\n現在、タグは設定されていません。"
+        view = discord.ui.View(timeout=180)
+        view.add_item(VariantSetButton(settings))
+        view.add_item(VariantClearButton(settings))
+        view.add_item(VariantSummaryButton(settings))
+        await interaction.response.send_message(
+            f"🧪 **{settings['my_deck']}** の個人検証タグ管理{active_note}\n"
+            f"（カード1枚単位で構築を変えた場合などに、勝率だけ自分用に分けて記録できます。"
+            f"公開集計には一切反映されません）",
+            view=view,
+            ephemeral=True,
+        )
+
+
 class SensekiPanelView(discord.ui.View):
     """timeout=None＋固定custom_idで永続化。BOT再起動後もボタンが反応し続ける"""
 
@@ -2343,6 +2619,7 @@ class SensekiPanelView(discord.ui.View):
         self.add_item(PanelDeckSwitchButton())
         self.add_item(PanelRankUpdateButton())
         self.add_item(PanelFormatButton())
+        self.add_item(PanelVariantButton())
 
 
 # ==============================
@@ -3167,6 +3444,63 @@ class SensekiCog(commands.Cog):
         await interaction.response.send_message(
             header, view=TemplateView(templates, mode), ephemeral=True
         )
+
+    @deck.command(name="検証開始", description="今のデッキに個人用の検証タグを付けます（自分だけに見える集計用）")
+    @app_commands.describe(タグ名="例：アンテマリア採用、フルスペル型 など")
+    async def start_variant(self, interaction: discord.Interaction, タグ名: str):
+        settings = await get_user_settings(str(interaction.user.id))
+        if settings is None or not settings.get("my_deck"):
+            await interaction.response.send_message(
+                "まず `/戦績 設定` で使用デッキを登録してください。", ephemeral=True
+            )
+            return
+        label = タグ名.strip()[:50]
+        if not label:
+            await interaction.response.send_message("タグ名を入力してください。", ephemeral=True)
+            return
+        await set_active_variant(
+            str(interaction.user.id), settings["format"], settings["my_class"], settings["my_deck"], label
+        )
+        await interaction.response.send_message(
+            f"🏷 検証タグ「{label}」を開始しました。", ephemeral=True
+        )
+
+    @deck.command(name="検証終了", description="今のデッキの検証タグを解除します")
+    async def stop_variant(self, interaction: discord.Interaction):
+        settings = await get_user_settings(str(interaction.user.id))
+        if settings is None or not settings.get("my_deck"):
+            await interaction.response.send_message(
+                "まず `/戦績 設定` で使用デッキを登録してください。", ephemeral=True
+            )
+            return
+        ok = await clear_active_variant(
+            str(interaction.user.id), settings["format"], settings["my_class"], settings["my_deck"]
+        )
+        msg = "🏷 検証タグを解除しました。" if ok else "現在、有効な検証タグはありません。"
+        await interaction.response.send_message(msg, ephemeral=True)
+
+    @deck.command(name="検証集計", description="今のデッキの検証タグごとの勝率を確認します（自分だけに表示）")
+    async def variant_summary_cmd(self, interaction: discord.Interaction):
+        settings = await get_user_settings(str(interaction.user.id))
+        if settings is None or not settings.get("my_deck"):
+            await interaction.response.send_message(
+                "まず `/戦績 設定` で使用デッキを登録してください。", ephemeral=True
+            )
+            return
+        rows = await get_variant_summary(
+            str(interaction.user.id), settings["format"], settings["my_class"], settings["my_deck"]
+        )
+        if not rows:
+            await interaction.response.send_message(
+                f"**{settings['my_deck']}**にはまだ検証タグ付きの記録がありません。", ephemeral=True
+            )
+            return
+        lines = [f"🧪 **{settings['my_deck']}** 個人検証タグ別勝率（自分だけに表示）"]
+        for r in rows:
+            total = r["total"]; wins = r["wins"] or 0
+            rate = wins / total * 100 if total else 0
+            lines.append(f"・**{r['variant_label']}**：勝率 {rate:.1f}%（{wins}勝{total-wins}敗・{total}戦）")
+        await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
     # ---- /ランク更新 ----
     @senseki.command(name="ランク更新", description="ランク帯とグレードだけを変更します（デッキ設定はそのまま）")
