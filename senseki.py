@@ -23,13 +23,14 @@ senseki.py
     登録        よく使うデッキを登録（複数可）
     切替        登録済みから選んで切替（ランクは維持）
     検証開始／検証終了／検証集計  個人用デッキバリアント（下記）の管理者フォールバック。
-                通常はパネルの「🧪 デッキ検証」ボタンから使う
+                通常はパネルの「⚙️ 設定を変える」→「🧪 デッキ検証」から使う
 
   /戦績管理（管理者のみ表示）
     パネル設置    記録・切替・ランク更新・取消・成績確認・弱点対面・デッキ検証の各ボタンを常設
     掲示板設置    全員の使用デッキ＆ランクの一覧を常設（設定変更時に自動更新）
     全体集計      その瞬間のDBから全体・先後別・クラス別・対面別を表示
     環境分析画像  クラス使用率・対面マトリクス・先攻後攻をPNG画像で表示（SENSEKI_ADMIN_USER_ID本人のみ）
+    環境レポート設置／投稿／停止  同じ画像＋AI分析を2日に1回12時にサーバーへ自動投稿する
     データ抽出    生データ＋集計のExcelを出力（毎週月曜9:00にDMへ自動送信）
     シート同期    Googleスプレッドシートへ即時同期
     シート診断    スプレッドシート連携の設定状況
@@ -61,7 +62,7 @@ senseki.py
   正しく設定されていることを先に確認すること。
 
 フェーズ2以降で追加するもの（このファイルには未実装）
-  - 環境ID管理と /環境切替（現状は CURRENT_ENV_ID を固定値で使用）
+  - 環境IDは ENV_SCHEDULE の開始日時で自動切替（/環境切替 コマンドは未実装）
   - デッキタイプのオートコンプリート・表記揺れ統合（/デッキ名整理）
   - /戦績比較（メンバー限定・全体勝率との比較）
   - ランク帯別の集計（データは記録済みなので後から出せる）
@@ -81,6 +82,13 @@ import sqlite3
 from datetime import datetime, time as dtime, timedelta, timezone
 
 import discord
+
+try:  # AI分析（環境レポート用）。未導入でもBOTは止めない
+    from anthropic import AsyncAnthropic
+    ANTHROPIC_IMPORT_ERROR = None
+except Exception as _e:
+    AsyncAnthropic = None
+    ANTHROPIC_IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 from discord import app_commands
 from discord.ext import commands, tasks
 
@@ -278,12 +286,36 @@ CR_GRADE_NONE_LABEL = "グレードなし（CR1650未満）"
 # CRグレードを入力できるランク帯
 GRAND_MASTER_TIER = "グランドマスター"
 
-# 環境ID（暫定固定値）
-# フェーズ2で /環境切替 と data/environment.json による管理に置き換える。
-# それまでは記録される全レコードがこの環境IDになる。
-# 新弾リリース（2026-08-27）に合わせて設定。新弾切り替わり後に変更する場合は
-# ここを書き換えてから再デプロイすること。
-CURRENT_ENV_ID = "2026-08-beyond-2"
+# 環境ID の一覧（古い順）。各環境は「開始日時」になった瞬間に自動で切り替わる。
+# 新弾のたびに、ここへ1行追加して再デプロイする（開始日時の前に反映しておくこと）。
+# 切り替わると BOT が1分以内に検知し、前の環境のデータをExcelで管理者にDMする。
+# 過去のデータは消さない（環境IDで分けて保存しているだけ）。
+ENV_SCHEDULE = [
+    ("2026-08-beyond-2", datetime(2026, 8, 27, 0, 0, tzinfo=JST)),
+    # 新弾（2026-10-28）のメンテナンス開始時刻で切り替え
+    ("2026-10-beyond-3", datetime(2026, 10, 28, 10, 0, tzinfo=JST)),
+]
+
+
+def current_env_id(now: datetime = None) -> str:
+    """今の環境ID。ENV_SCHEDULE の開始日時を過ぎた最後の環境を返す"""
+    now = now or datetime.now(JST)
+    env = ENV_SCHEDULE[0][0]
+    for env_id, start in ENV_SCHEDULE:
+        if now >= start:
+            env = env_id
+    return env
+
+
+def previous_env_id(now: datetime = None):
+    """1つ前の環境ID（最初の環境なら None）"""
+    ids = [e for e, _ in ENV_SCHEDULE]
+    i = ids.index(current_env_id(now))
+    return ids[i - 1] if i > 0 else None
+
+
+# 環境の切り替わりを検知するために、最後に確認した環境IDを bot_state に保存する
+ENV_STATE_KEY = "last_env_id"
 
 # 集計データの定期抽出先（管理者DM）
 # しろくさのユーザーID（koken_rank.py の ADOPT_JUDGE_USER_ID と同じ値）
@@ -293,6 +325,47 @@ SENSEKI_ADMIN_USER_ID = 346475730458378240
 WEEKLY_EXPORT_WEEKDAY = 0   # 0=月曜
 WEEKLY_EXPORT_HOUR = 9
 WEEKLY_EXPORT_MINUTE = 0
+
+# 環境レポート（サーバーへの自動投稿）のタイミング（JST）
+# 投稿先は /戦績管理 環境レポート設置 を実行したチャンネル（未設置なら投稿しない）
+# 毎日 ENV_REPORT_HOUR:ENV_REPORT_MINUTE に確認し、前回の投稿から
+# ENV_REPORT_INTERVAL_DAYS 日以上たっていれば投稿する（手動投稿もここに数える）
+ENV_REPORT_INTERVAL_DAYS = 2
+ENV_REPORT_HOUR = 12
+ENV_REPORT_MINUTE = 0
+# 現環境の記録がこれ未満の週は投稿しない（少なすぎると偏った数字が出るため）
+ENV_REPORT_MIN_MATCHES = 30
+ENV_REPORT_CHANNEL_KEY = "env_report_channel_id"
+ENV_REPORT_PANEL_KEY = "env_report_panel_channel_id"
+# レポートの感想・考察を書いてもらうチャンネル（任意。設置コマンドで指定）
+ENV_REPORT_DISCUSS_KEY = "env_report_discuss_channel_id"
+# 前回投稿時点の「環境ID|試合数|記録者数」。前回からの増加分を出すのに使う
+ENV_REPORT_LAST_KEY = "env_report_last"
+# 前回投稿した日（JSTの日付 YYYY-MM-DD）
+ENV_REPORT_LAST_DATE_KEY = "env_report_last_date"
+
+# ---- 環境レポートのAI分析 ----
+# APIキーの環境変数名。攻略情報抽出BOT（kouryaku_mining.py）と同じキーを使う想定
+ENV_REPORT_AI_KEY_ENV = "ANTHROPIC_API_KEY"
+ENV_REPORT_AI_MODEL = os.environ.get("SENSEKI_AI_MODEL", "claude-haiku-5-5")
+# AIに渡す相手デッキの件数（当たった回数の多い順）
+ENV_REPORT_AI_TOP_DECKS = 10
+# 「直近」とみなす日数。直近と、それより前の記録を比べて環境の変化を見る
+ENV_REPORT_AI_RECENT_DAYS = 7
+# 環境レポートの投稿ごとに、感想・考察用のスレッドを自動で立てるか
+ENV_REPORT_CREATE_THREAD = False
+# 個人のAI分析（パネルの「🤖 AIで分析」）
+# 押すたびにAPI費用がかかるため1人1日1回まで。モデルは環境レポートとは別に指定できる
+AI_PERSONAL_MODEL = os.environ.get("SENSEKI_AI_PERSONAL_MODEL", "claude-haiku-5-5")
+AI_PERSONAL_MIN_MATCHES = 20      # 今のデッキでこれ未満の記録なら分析しない
+AI_PERSONAL_MIN_PAIR = 5          # 対面ごとの数字はこれ以上の試合数だけ渡す
+AI_PERSONAL_RECENT = 20           # 「直近」とみなす試合数
+AI_PERSONAL_STATE_PREFIX = "ai_personal_last_date:"
+
+ENV_REPORT_AI_DISCLAIMER = (
+    "-# 🤖 AI分析は開発中の機能です。集計の読み違いや、実際の環境と異なる内容を含む場合があります。"
+    "参考程度にご覧ください。"
+)
 
 # Googleスプレッドシートへの日次同期のタイミング（JST）
 # 環境変数が未設定なら同期はスキップされる（senseki_sheets.py 参照）
@@ -310,11 +383,6 @@ MIN_SAMPLE_FOR_STATS = 30
 # 個人向けより緩めのしきい値にしている。
 MATCHUP_MATRIX_MIN_SAMPLE = 15
 
-# 相手デッキの選択画面を出し始める、候補デッキ名の最低件数
-# 0にすると候補ゼロでも画面が出る（「分からない」しか押せない状態になる）。
-# 1にしておくと、そのクラスのデッキ名が1つでも登録された時点で選択画面が出る。
-# 候補は各ユーザーが初回設定で登録した自分のデッキから自動的に貯まる。
-MIN_DECK_CANDIDATES = 1
 
 # 個人の弱点対面表示の最低試合数
 # 30戦は運用初期には現実的でないため、個人向けは緩めにする。
@@ -345,10 +413,14 @@ def _parse_role_ids(raw: str) -> set:
             ids.add(int(part))
     return ids
 
-# ②（全体平均との比較）を、有料化前に環境限定で無料開放するスイッチ。
-# 今回の環境（2026-08-beyond-2）は無料開放。次の環境に切り替える際は
-# 必ず False に戻すこと（CURRENT_ENV_ID の書き換えと同時に見直す）。
-PREMIUM_FREE_THIS_ENV = True
+# ②（全体平均との比較）を、有料化前に環境限定で無料開放する環境IDの一覧。
+# ここに入っている環境の間だけ全員無料。新しい環境も無料開放を続けるなら、
+# ENV_SCHEDULE に追加した環境IDをここにも足すこと。
+PREMIUM_FREE_ENV_IDS = {"2026-08-beyond-2", "2026-10-beyond-3"}
+
+
+def premium_free_this_env() -> bool:
+    return current_env_id() in PREMIUM_FREE_ENV_IDS
 
 # 初回参加者向けの無料キャンペーン：初めて `/戦績 設定` した日から何日間、
 # メンバーでなくても②が使えるか（サブ垢は別アカウント＝別トライアルとして扱う）
@@ -405,7 +477,7 @@ def premium_access(user: discord.Member, started_at: str, campaign_start_at: str
     """
     if is_member(user):
         return True, "member", None
-    if PREMIUM_FREE_THIS_ENV:
+    if premium_free_this_env():
         return True, "env_free", None
 
     campaign_start = _parse_iso(campaign_start_at)
@@ -658,13 +730,13 @@ def _register_deck_name(conn, class_name: str, deck_name: str):
     row = conn.execute(
         "SELECT id, use_count FROM deck_names "
         "WHERE class_name = ? AND deck_name = ? AND env_id = ?",
-        (class_name, deck_name, CURRENT_ENV_ID),
+        (class_name, deck_name, current_env_id()),
     ).fetchone()
     if row is None:
         conn.execute(
             "INSERT INTO deck_names (class_name, deck_name, use_count, is_official, env_id) "
             "VALUES (?, ?, 1, 0, ?)",
-            (class_name, deck_name, CURRENT_ENV_ID),
+            (class_name, deck_name, current_env_id()),
         )
     else:
         conn.execute(
@@ -683,7 +755,7 @@ def _insert_match_sync(user_id: str, settings: dict, opp_class: str, opp_deck,
                 opp_class, opp_deck, is_first, is_win
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            user_id, now, CURRENT_ENV_ID, settings["format"], settings["my_class"],
+            user_id, now, current_env_id(), settings["format"], settings["my_class"],
             settings.get("my_deck"), settings.get("rank_tier"), settings.get("cr_grade"),
             opp_class, opp_deck, 1 if is_first else 0, 1 if is_win else 0,
         ))
@@ -715,7 +787,7 @@ def _get_deck_names_sync(class_name: str, limit: int = 20):
             WHERE class_name = ? AND env_id = ?
             ORDER BY is_official DESC, use_count DESC, deck_name
             LIMIT ?
-        """, (class_name, CURRENT_ENV_ID, limit)).fetchall()
+        """, (class_name, current_env_id(), limit)).fetchall()
         return [r["deck_name"] for r in rows]
     finally:
         conn.close()
@@ -767,11 +839,11 @@ def _merge_deck_name_sync(class_name: str, old_name: str, new_name: str, mark_of
         # 候補プール（現環境）：件数を合算して旧レコードは削除
         old_row = conn.execute(
             "SELECT id, use_count FROM deck_names WHERE class_name = ? AND deck_name = ? AND env_id = ?",
-            (class_name, old_name, CURRENT_ENV_ID),
+            (class_name, old_name, current_env_id()),
         ).fetchone()
         new_row = conn.execute(
             "SELECT id, use_count FROM deck_names WHERE class_name = ? AND deck_name = ? AND env_id = ?",
-            (class_name, new_name, CURRENT_ENV_ID),
+            (class_name, new_name, current_env_id()),
         ).fetchone()
         if old_row and new_row:
             conn.execute(
@@ -785,7 +857,7 @@ def _merge_deck_name_sync(class_name: str, old_name: str, new_name: str, mark_of
         if mark_official:
             conn.execute(
                 "UPDATE deck_names SET is_official = 1 WHERE class_name = ? AND deck_name = ? AND env_id = ?",
-                (class_name, new_name, CURRENT_ENV_ID),
+                (class_name, new_name, current_env_id()),
             )
 
         conn.commit()
@@ -957,6 +1029,31 @@ async def delete_last_match(user_id: str):
     return result
 
 
+def _delete_match_by_id_sync(user_id: str, match_id: int):
+    """記録完了画面の「取り消す」用。本人の記録だけを消す"""
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT id, opp_class, is_win, recorded_at FROM matches WHERE id = ? AND user_id = ?",
+            (match_id, user_id),
+        ).fetchone()
+        if row is None:
+            return None
+        conn.execute("DELETE FROM matches WHERE id = ?", (row["id"],))
+        conn.execute("DELETE FROM personal_deck_variants WHERE match_id = ?", (row["id"],))
+        conn.commit()
+        return dict(row)
+    finally:
+        conn.close()
+
+
+async def delete_match_by_id(user_id: str, match_id: int):
+    result = await asyncio.to_thread(_delete_match_by_id_sync, user_id, match_id)
+    if result is not None:
+        mark_dirty()
+    return result
+
+
 # ---- 個人用デッキバリアント（検証タグ） ----
 # 生データ（matches.my_deck）は一切変更しない。共有集計（環境デッキ分布・対面マトリクス等）は
 # personal_deck_variants / user_variant_state のどちらのテーブルも参照しないので、
@@ -1068,7 +1165,7 @@ def _get_summary_sync(user_id: str):
                 SUM(is_win) AS wins
             FROM matches
             WHERE user_id = ? AND env_id = ?
-        """, (user_id, CURRENT_ENV_ID)).fetchone()
+        """, (user_id, current_env_id())).fetchone()
         total = row["total"] or 0
         wins = row["wins"] or 0
         return {"total": total, "wins": wins, "losses": total - wins}
@@ -1080,12 +1177,12 @@ async def get_summary(user_id: str):
     return await asyncio.to_thread(_get_summary_sync, user_id)
 
 
-def _fetch_all_matches_sync(env_only: bool):
+def _fetch_all_matches_sync(env_only: bool, env_id: str = None):
     conn = _connect()
     try:
         if env_only:
             rows = conn.execute(
-                "SELECT * FROM matches WHERE env_id = ? ORDER BY id", (CURRENT_ENV_ID,)
+                "SELECT * FROM matches WHERE env_id = ? ORDER BY id", (env_id or current_env_id(),)
             ).fetchall()
         else:
             rows = conn.execute("SELECT * FROM matches ORDER BY id").fetchall()
@@ -1094,8 +1191,8 @@ def _fetch_all_matches_sync(env_only: bool):
         conn.close()
 
 
-async def fetch_all_matches(env_only: bool = True):
-    return await asyncio.to_thread(_fetch_all_matches_sync, env_only)
+async def fetch_all_matches(env_only: bool = True, env_id: str = None):
+    return await asyncio.to_thread(_fetch_all_matches_sync, env_only, env_id)
 
 
 def _fetch_all_user_settings_sync():
@@ -1232,21 +1329,6 @@ async def find_guide_link(my_class: str, opp_class: str):
 
 # ---- 個人の対面別集計（弱点対面の抽出用） ----
 
-def _get_personal_matchups_sync(user_id: str):
-    conn = _connect()
-    try:
-        rows = conn.execute("""
-            SELECT my_class, opp_class, COUNT(*) AS total, SUM(is_win) AS wins
-            FROM matches WHERE user_id = ? AND env_id = ?
-            GROUP BY my_class, opp_class
-        """, (user_id, CURRENT_ENV_ID)).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
-
-
-async def get_personal_matchups(user_id: str):
-    return await asyncio.to_thread(_get_personal_matchups_sync, user_id)
 
 
 def _get_deck_total_sync(user_id: str, format_: str, my_deck) -> int:
@@ -1256,7 +1338,7 @@ def _get_deck_total_sync(user_id: str, format_: str, my_deck) -> int:
         row = conn.execute("""
             SELECT COUNT(*) AS total FROM matches
             WHERE user_id = ? AND env_id = ? AND format = ? AND my_deck = ?
-        """, (user_id, CURRENT_ENV_ID, format_, my_deck)).fetchone()
+        """, (user_id, current_env_id(), format_, my_deck)).fetchone()
         return row["total"] or 0
     finally:
         conn.close()
@@ -1273,7 +1355,7 @@ def _get_deck_summary_sync(user_id: str, format_: str, my_deck):
         row = conn.execute("""
             SELECT COUNT(*) AS total, SUM(is_win) AS wins FROM matches
             WHERE user_id = ? AND env_id = ? AND format = ? AND my_deck = ?
-        """, (user_id, CURRENT_ENV_ID, format_, my_deck)).fetchone()
+        """, (user_id, current_env_id(), format_, my_deck)).fetchone()
         return {"total": row["total"] or 0, "wins": row["wins"] or 0}
     finally:
         conn.close()
@@ -1291,7 +1373,7 @@ def _get_deck_recent_summary_sync(user_id: str, format_: str, my_deck, limit: in
             SELECT is_win FROM matches
             WHERE user_id = ? AND env_id = ? AND format = ? AND my_deck = ?
             ORDER BY recorded_at DESC LIMIT ?
-        """, (user_id, CURRENT_ENV_ID, format_, my_deck, limit)).fetchall()
+        """, (user_id, current_env_id(), format_, my_deck, limit)).fetchall()
         total = len(rows)
         wins = sum(r["is_win"] for r in rows)
         return {"total": total, "wins": wins}
@@ -1311,7 +1393,7 @@ def _get_recent_matches_sync(user_id: str, limit: int):
             SELECT format, my_deck, opp_class, opp_deck, is_first, is_win, recorded_at
             FROM matches WHERE user_id = ? AND env_id = ?
             ORDER BY recorded_at DESC LIMIT ?
-        """, (user_id, CURRENT_ENV_ID, limit)).fetchall()
+        """, (user_id, current_env_id(), limit)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -1330,7 +1412,7 @@ def _get_deck_matchups_sync(user_id: str, format_: str, my_deck):
             FROM matches
             WHERE user_id = ? AND env_id = ? AND format = ? AND my_deck = ?
             GROUP BY opp_class
-        """, (user_id, CURRENT_ENV_ID, format_, my_deck)).fetchall()
+        """, (user_id, current_env_id(), format_, my_deck)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -1349,7 +1431,7 @@ def _get_global_deck_matchups_sync(format_: str, my_deck):
             FROM matches
             WHERE env_id = ? AND format = ? AND my_deck = ?
             GROUP BY opp_class
-        """, (CURRENT_ENV_ID, format_, my_deck)).fetchall()
+        """, (current_env_id(), format_, my_deck)).fetchall()
         return {r["opp_class"]: dict(r) for r in rows}
     finally:
         conn.close()
@@ -1368,7 +1450,7 @@ def _get_deck_history_sync(user_id: str, format_: str):
             FROM matches
             WHERE user_id = ? AND env_id = ? AND format = ?
             ORDER BY recorded_at ASC
-        """, (user_id, CURRENT_ENV_ID, format_)).fetchall()
+        """, (user_id, current_env_id(), format_)).fetchall()
     finally:
         conn.close()
 
@@ -1402,7 +1484,7 @@ def _get_first_second_matchups_sync(user_id: str, format_: str, my_deck):
             FROM matches
             WHERE user_id = ? AND env_id = ? AND format = ? AND my_deck = ?
             GROUP BY opp_class, is_first
-        """, (user_id, CURRENT_ENV_ID, format_, my_deck)).fetchall()
+        """, (user_id, current_env_id(), format_, my_deck)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -1421,7 +1503,7 @@ def _get_deck_opp_deck_fs_sync(user_id: str, format_: str, my_deck):
             FROM matches
             WHERE user_id = ? AND env_id = ? AND format = ? AND my_deck = ? AND opp_deck IS NOT NULL
             GROUP BY opp_class, opp_deck, is_first
-        """, (user_id, CURRENT_ENV_ID, format_, my_deck)).fetchall()
+        """, (user_id, current_env_id(), format_, my_deck)).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -1448,6 +1530,114 @@ async def log_command_usage(user_id: str, command: str):
     await asyncio.to_thread(_log_command_usage_sync, user_id, command)
 
 
+def _get_activity_stats_sync():
+    """週ごとの記録者数と、検証タグの利用状況（管理者向け）"""
+    conn = _connect()
+    try:
+        now = datetime.now(JST)
+        w1 = (now - timedelta(days=7)).isoformat()
+        w2 = (now - timedelta(days=14)).isoformat()
+        this_week = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) AS u, COUNT(*) AS m FROM matches WHERE recorded_at >= ?", (w1,)
+        ).fetchone()
+        last_week = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) AS u, COUNT(*) AS m FROM matches "
+            "WHERE recorded_at >= ? AND recorded_at < ?", (w2, w1)
+        ).fetchone()
+        variants = conn.execute(
+            "SELECT COUNT(DISTINCT user_id) AS u, COUNT(*) AS m FROM personal_deck_variants"
+        ).fetchone()
+        active_tags = conn.execute("SELECT COUNT(DISTINCT user_id) AS u FROM user_variant_state").fetchone()
+        return {
+            "this_week_users": this_week["u"], "this_week_matches": this_week["m"],
+            "last_week_users": last_week["u"], "last_week_matches": last_week["m"],
+            "variant_users": variants["u"], "variant_matches": variants["m"],
+            "active_tag_users": active_tags["u"],
+        }
+    finally:
+        conn.close()
+
+
+async def get_activity_stats():
+    return await asyncio.to_thread(_get_activity_stats_sync)
+
+
+def _get_personal_ai_data_sync(user_id: str, format_: str, my_class: str, my_deck: str):
+    """個人のAI分析用：本人の今のデッキの記録と、同じデッキを使ったほかの人の記録（現環境）"""
+    conn = _connect()
+    try:
+        cols = "user_id, recorded_at, opp_class, opp_deck, is_first, is_win"
+        mine = conn.execute(
+            f"SELECT {cols} FROM matches WHERE env_id = ? AND user_id = ? AND format = ? "
+            "AND my_class = ? AND my_deck = ? ORDER BY id",
+            (current_env_id(), user_id, format_, my_class, my_deck),
+        ).fetchall()
+        everyone = conn.execute(
+            f"SELECT {cols} FROM matches WHERE env_id = ? AND user_id != ? AND format = ? "
+            "AND my_class = ? AND my_deck = ?",
+            (current_env_id(), user_id, format_, my_class, my_deck),
+        ).fetchall()
+        return [dict(r) for r in mine], [dict(r) for r in everyone]
+    finally:
+        conn.close()
+
+
+async def get_personal_ai_data(user_id: str, format_: str, my_class: str, my_deck: str):
+    return await asyncio.to_thread(_get_personal_ai_data_sync, user_id, format_, my_class, my_deck)
+
+
+def build_personal_ai_dataset(settings: dict, mine: list, everyone: list) -> str:
+    """個人のAI分析に渡す集計テキスト。比較相手は「同じデッキを使ったほかの人」（本人を含めると差が薄まるため）"""
+    def stat(rs):
+        n = len(rs)
+        return n, (sum(1 for r in rs if r["is_win"]) / n * 100 if n else 0.0)
+
+    n, rate = stat(mine)
+    gn, grate = stat(everyone)
+    lines = [
+        f"デッキ：{settings['my_deck']}（{settings['my_class']}・{FORMAT_LABELS.get(settings['format'], settings['format'])}）",
+        f"ランク帯：{settings.get('rank_tier') or '不明'}",
+        f"本人：{n}戦・勝率{rate:.1f}%　／　同じデッキのほかの人：{gn}戦・勝率{grate:.1f}%",
+        "",
+        "■ 先攻後攻（本人／同じデッキのほかの人）",
+    ]
+    for flag, label in ((1, "先攻"), (0, "後攻")):
+        a = [r for r in mine if r["is_first"] == flag]
+        b = [r for r in everyone if r["is_first"] == flag]
+        an, ar = stat(a)
+        bn, br = stat(b)
+        lines.append(f"- {label}：本人{an}戦・{ar:.1f}%／ほかの人{bn}戦・{br:.1f}%")
+
+    for title, key in (
+        ("相手クラス", lambda r: r["opp_class"]),
+        ("相手デッキ", lambda r: f"{r['opp_deck']}（{r['opp_class']}）" if r.get("opp_deck") else None),
+    ):
+        lines.append("")
+        lines.append(f"■ {title}別（本人が{AI_PERSONAL_MIN_PAIR}戦以上のもの。本人の勝率／同じデッキのほかの人の勝率）")
+        groups: dict = {}
+        for r in mine:
+            k = key(r)
+            if k is not None:
+                groups.setdefault(k, []).append(r)
+        shown = 0
+        for k, rs in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+            if len(rs) < AI_PERSONAL_MIN_PAIR:
+                continue
+            an, ar = stat(rs)
+            bn, br = stat([r for r in everyone if key(r) == k])
+            lines.append(f"- {k}：本人{an}戦・{ar:.1f}%／ほかの人{bn}戦・{br:.1f}%（差 {ar - br:+.1f}）")
+            shown += 1
+        if shown == 0:
+            lines.append("- （該当なし：対面ごとの試合数がまだ足りない）")
+
+    if n >= AI_PERSONAL_RECENT * 2:
+        rn, rr = stat(mine[-AI_PERSONAL_RECENT:])
+        bn, br = stat(mine[:-AI_PERSONAL_RECENT])
+        lines.append("")
+        lines.append(f"■ 調子：直近{rn}戦の勝率{rr:.1f}%／それより前{bn}戦の勝率{br:.1f}%")
+    return "\n".join(lines)
+
+
 def _get_command_usage_stats_sync():
     conn = _connect()
     try:
@@ -1464,7 +1654,7 @@ def _get_command_usage_stats_sync():
             "SELECT COUNT(DISTINCT user_id) AS n FROM command_usage"
         ).fetchone()["n"] or 0
         recorders = conn.execute(
-            "SELECT COUNT(DISTINCT user_id) AS n FROM matches WHERE env_id = ?", (CURRENT_ENV_ID,)
+            "SELECT COUNT(DISTINCT user_id) AS n FROM matches WHERE env_id = ?", (current_env_id(),)
         ).fetchone()["n"] or 0
         return {
             "by_command": [dict(r) for r in by_command],
@@ -1489,24 +1679,24 @@ def _get_global_summary_sync():
             SELECT COUNT(*) AS total, SUM(is_win) AS wins,
                    COUNT(DISTINCT user_id) AS users
             FROM matches WHERE env_id = ?
-        """, (CURRENT_ENV_ID,)).fetchone()
+        """, (current_env_id(),)).fetchone()
 
         by_first = conn.execute("""
             SELECT is_first, COUNT(*) AS total, SUM(is_win) AS wins
             FROM matches WHERE env_id = ? GROUP BY is_first
-        """, (CURRENT_ENV_ID,)).fetchall()
+        """, (current_env_id(),)).fetchall()
 
         by_my_class = conn.execute("""
             SELECT my_class, COUNT(*) AS total, SUM(is_win) AS wins
             FROM matches WHERE env_id = ?
             GROUP BY my_class ORDER BY total DESC
-        """, (CURRENT_ENV_ID,)).fetchall()
+        """, (current_env_id(),)).fetchall()
 
         by_opp_class = conn.execute("""
             SELECT opp_class, COUNT(*) AS total, SUM(is_win) AS wins
             FROM matches WHERE env_id = ?
             GROUP BY opp_class ORDER BY total DESC
-        """, (CURRENT_ENV_ID,)).fetchall()
+        """, (current_env_id(),)).fetchall()
 
         return {
             "total": total_row["total"] or 0,
@@ -1522,6 +1712,122 @@ def _get_global_summary_sync():
 
 async def get_global_summary():
     return await asyncio.to_thread(_get_global_summary_sync)
+
+
+def build_ai_dataset(matches: list[dict], env_id: str, now: datetime):
+    """
+    環境レポートのAI分析に渡す集計テキストを作る（ローテーションのみ）。
+    使用率は相手側、勝ちやすさは記録者平均との差、直近と以前の比較を含める。
+    記録が無ければ None。
+    """
+    rows = [m for m in matches if m.get("format") == "rotation"]
+    n = len(rows)
+    if n == 0:
+        return None
+
+    def wins(rs):
+        return sum(1 for r in rs if r["is_win"])
+
+    def pct(a, b):
+        return a / b * 100 if b else 0.0
+
+    avg = pct(wins(rows), n)
+    users: dict[str, int] = {}
+    for r in rows:
+        users[r["user_id"]] = users.get(r["user_id"], 0) + 1
+    top4 = sum(sorted(users.values(), reverse=True)[:4])
+
+    lines = [
+        f"環境ID：{env_id}（ローテーションのみ）",
+        f"総試合数：{n}戦 / 記録者：{len(users)}名 / 記録者全体の平均勝率：{avg:.1f}%",
+        f"記録の偏り：上位4名の記録が全体の{pct(top4, n):.0f}%",
+    ]
+    ranks: dict[str, int] = {}
+    for r in rows:
+        k = r.get("rank_tier") or "不明"
+        ranks[k] = ranks.get(k, 0) + 1
+    lines.append("ランク帯の内訳：" + "、".join(
+        f"{k}{pct(v, n):.0f}%" for k, v in sorted(ranks.items(), key=lambda kv: -kv[1])
+    ))
+    lines.append("")
+
+    # 相手クラス：使用率と、記録者から見た勝率（平均との差）
+    lines.append("■ 相手クラスの使用率（＝環境の使用率）と、記録者から見た勝率")
+    by_cls: dict[str, list] = {}
+    for r in rows:
+        by_cls.setdefault(r["opp_class"], []).append(r)
+    for c, rs in sorted(by_cls.items(), key=lambda kv: -len(kv[1])):
+        w = pct(wins(rs), len(rs))
+        lines.append(f"- {c}：{len(rs)}戦（{pct(len(rs), n):.1f}%）・勝率{w:.1f}%（平均との差 {w - avg:+.1f}）")
+    lines.append("")
+
+    # 相手デッキ
+    with_deck = [r for r in rows if r.get("opp_deck")]
+    lines.append(f"■ 相手デッキの使用率（相手デッキの入力率{pct(len(with_deck), n):.0f}%。入力のあった試合のみで計算）")
+    by_deck: dict[tuple, list] = {}
+    for r in with_deck:
+        by_deck.setdefault((r["opp_class"], r["opp_deck"]), []).append(r)
+    for (c, d), rs in sorted(by_deck.items(), key=lambda kv: -len(kv[1]))[:ENV_REPORT_AI_TOP_DECKS]:
+        w = pct(wins(rs), len(rs))
+        lines.append(
+            f"- {d}（{c}）：{len(rs)}戦（{pct(len(rs), len(with_deck)):.1f}%）・勝率{w:.1f}%（平均との差 {w - avg:+.1f}）"
+        )
+    lines.append("")
+
+    # 先攻後攻
+    lines.append("■ 先攻後攻")
+    for flag, label in ((1, "先攻"), (0, "後攻")):
+        rs = [r for r in rows if r["is_first"] == flag]
+        if rs:
+            lines.append(f"- {label}：{len(rs)}戦・勝率{pct(wins(rs), len(rs)):.1f}%")
+    lines.append("")
+
+    # 直近と以前の比較（相手クラス・相手デッキの使用率の変化）
+    def recorded(r):
+        try:
+            return datetime.fromisoformat(r["recorded_at"])
+        except (TypeError, ValueError):
+            return None
+
+    # 直近の試合数が少なすぎるときは、期間を倍に広げて比べる
+    for days in (ENV_REPORT_AI_RECENT_DAYS, ENV_REPORT_AI_RECENT_DAYS * 2):
+        cutoff = now - timedelta(days=days)
+        recent = [r for r in rows if (recorded(r) or now) >= cutoff]
+        before = [r for r in rows if (recorded(r) or now) < cutoff]
+        if len(recent) >= 30:
+            break
+    lines.append(f"■ 直近{days}日（{len(recent)}戦）と、それより前（{len(before)}戦）の比較")
+    if len(recent) < 30 or len(before) < 30:
+        lines.append("- 比較できるだけの試合数がまだない")
+    else:
+        def shares(rs, key):
+            out: dict = {}
+            for r in rs:
+                k = key(r)
+                if k is not None:
+                    out[k] = out.get(k, 0) + 1
+            total = sum(out.values()) or 1
+            return {k: v / total * 100 for k, v in out.items()}, out
+
+        for title, key in (
+            ("相手クラス", lambda r: r["opp_class"]),
+            ("相手デッキ", lambda r: f"{r['opp_deck']}（{r['opp_class']}）" if r.get("opp_deck") else None),
+        ):
+            rec_s, rec_c = shares(recent, key)
+            bef_s, _ = shares(before, key)
+            diffs = [
+                (k, rec_s.get(k, 0.0) - bef_s.get(k, 0.0), rec_c.get(k, 0))
+                for k in set(rec_s) | set(bef_s)
+            ]
+            diffs.sort(key=lambda x: -abs(x[1]))
+            lines.append(f"{title}（変化の大きい順）：")
+            for k, d, c in diffs[:5]:
+                lines.append(
+                    f"- {k}：以前{bef_s.get(k, 0.0):.1f}% → 直近{rec_s.get(k, 0.0):.1f}%（{d:+.1f}・直近{c}戦）"
+                )
+    return "\n".join(lines)
+
+
 
 
 def _get_class_matchup_matrix_sync(env_id: str):
@@ -1563,7 +1869,7 @@ def _get_class_matchup_matrix_sync(env_id: str):
 
 
 async def get_class_matchup_matrix(env_id: str = None):
-    return await asyncio.to_thread(_get_class_matchup_matrix_sync, env_id or CURRENT_ENV_ID)
+    return await asyncio.to_thread(_get_class_matchup_matrix_sync, env_id or current_env_id())
 
 
 def combine_symmetric_class_stats(by_my_class: list, by_opp_class: list) -> list:
@@ -1597,57 +1903,100 @@ def combine_symmetric_class_stats(by_my_class: list, by_opp_class: list) -> list
 
 
 # ==============================
-# /戦績 のボタン形式フロー
+# /戦績 の記録画面（1画面方式）
 # ==============================
+# 1画面に「①相手クラス」「②相手デッキ（任意）」「③先攻/後攻」「④勝敗」を並べる。
+# 試合開始時に①③を選んでおき、試合中に分かれば②、試合後に④を押すと記録される。
+# 選んだ内容はユーザーごとにメモリに一時保存し、受付時間切れのあとでも
+# パネルから開き直せば続きから再開できる（BOTが再起動すると消える）。
+
+# 一時保存した選択内容を復元する期限（分）
+FLOW_DRAFT_TTL_MINUTES = 60
+
+# user_id -> {"opp_class", "opp_deck", "is_first", "saved_at", "settings_key"}
+_FLOW_DRAFTS: dict[str, dict] = {}
+
+
+def _settings_key(settings: dict) -> tuple:
+    """デッキを切り替えたあとに古い選択内容を復元しないための目印"""
+    return (settings.get("format"), settings.get("my_class"), settings.get("my_deck"))
+
+
+def _save_flow_draft(view: "SensekiFlowView"):
+    if view.opp_class is None and view.opp_deck is None and view.is_first is None:
+        _FLOW_DRAFTS.pop(view.user_id, None)
+        return
+    _FLOW_DRAFTS[view.user_id] = {
+        "opp_class": view.opp_class,
+        "opp_deck": view.opp_deck,
+        "is_first": view.is_first,
+        "saved_at": datetime.now(JST),
+        "settings_key": _settings_key(view.settings),
+    }
+
+
+def _load_flow_draft(user_id: str, settings: dict):
+    d = _FLOW_DRAFTS.get(user_id)
+    if d is None:
+        return None
+    expired = datetime.now(JST) - d["saved_at"] > timedelta(minutes=FLOW_DRAFT_TTL_MINUTES)
+    if expired or d["settings_key"] != _settings_key(settings):
+        _FLOW_DRAFTS.pop(user_id, None)
+        return None
+    return d
+
+
+def _clear_flow_draft(user_id: str):
+    _FLOW_DRAFTS.pop(user_id, None)
+
 
 class OpponentClassSelect(discord.ui.Select):
-    def __init__(self):
-        options = [discord.SelectOption(label=c, value=c) for c in CLASS_CHOICES]
-        super().__init__(placeholder="相手クラスを選択", options=options, min_values=1, max_values=1)
+    def __init__(self, selected=None):
+        options = [
+            discord.SelectOption(label=c, value=c, default=(c == selected))
+            for c in CLASS_CHOICES
+        ]
+        super().__init__(
+            placeholder="① 相手クラスを選択", options=options,
+            min_values=1, max_values=1, row=0,
+        )
 
     async def callback(self, interaction: discord.Interaction):
         view: SensekiFlowView = self.view
-        view.opp_class = self.values[0]
-
-        # そのクラスで既に使われているデッキ名を候補に出す。
-        # 候補が貯まるまでは相手デッキの画面自体を出さない。
-        # 運用初期に「分からない」を押させ続けるのは手間なだけで、
-        # データも増えないため。候補は各自が登録した自分のデッキから自動的に貯まる。
-        known = await get_deck_names(view.opp_class)
-        if len(known) < MIN_DECK_CANDIDATES:
+        new_class = self.values[0]
+        if new_class != view.opp_class:
+            # クラスを選び直したら、前のクラスのデッキ名は持ち越さない
             view.opp_deck = None
-            view.show_first_second()
-            await interaction.response.edit_message(
-                content=view.screen("先攻／後攻を選んでください。"),
-                view=view,
-            )
-            return
-
-        view.show_opponent_deck(known)
-        await interaction.response.edit_message(
-            content=view.screen(
-                "相手のデッキが分かれば選んでください。分からなければ「分からない」でOKです。"
-            ),
-            view=view,
-        )
+        view.opp_class = new_class
+        await view.refresh(interaction)
 
 
 class OpponentDeckSelect(discord.ui.Select):
-    """既知のデッキ名から選ぶ。候補になければモーダルで新規入力"""
+    """既知のデッキ名から選ぶ。候補になければモーダルで新規入力。未選択でも記録できる"""
 
     SKIP_VALUE = "__skip__"
     NEW_VALUE = "__new__"
 
-    def __init__(self, known_decks: list[str]):
+    def __init__(self, known_decks: list[str], selected, enabled: bool):
         options = [
             discord.SelectOption(label="分からない / 入力しない", value=self.SKIP_VALUE),
             discord.SelectOption(label="新しく入力する…", value=self.NEW_VALUE),
         ]
+        names = [n[:100] for n in known_decks]
+        # モーダルで入力した新しいデッキ名は候補にまだ無いので、先頭に足して選択状態にする
+        if selected and selected[:100] not in names:
+            names.insert(0, selected[:100])
         # Discordのセレクトは25件が上限。既定の2件を除いた分だけ載せる
-        for name in known_decks[:23]:
-            options.append(discord.SelectOption(label=name[:100], value=name[:100]))
+        for name in names[:23]:
+            options.append(discord.SelectOption(
+                label=name, value=name, default=(selected is not None and name == selected[:100]),
+            ))
+        placeholder = (
+            "② 相手デッキ（分かれば・任意）" if enabled else "② 相手デッキ（先に①を選んでください）"
+        )
         super().__init__(
-            placeholder="相手のデッキ（任意）", options=options, min_values=1, max_values=1
+            placeholder=placeholder, options=options,
+            min_values=1, max_values=1, row=1, disabled=not enabled,
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -1659,11 +2008,7 @@ class OpponentDeckSelect(discord.ui.Select):
             return
 
         view.opp_deck = None if value == self.SKIP_VALUE else value
-        view.show_first_second()
-        await interaction.response.edit_message(
-            content=view.screen("先攻／後攻を選んでください。"),
-            view=view,
-        )
+        await view.refresh(interaction)
 
 
 class OpponentDeckModal(discord.ui.Modal, title="相手のデッキ名を入力"):
@@ -1681,44 +2026,40 @@ class OpponentDeckModal(discord.ui.Modal, title="相手のデッキ名を入力"
     async def on_submit(self, interaction: discord.Interaction):
         view = self.flow_view
         view.opp_deck = str(self.deck_name.value).strip() or None
-        view.show_first_second()
-        await interaction.response.edit_message(
-            content=view.screen("先攻／後攻を選んでください。"),
-            view=view,
-        )
+        await view.refresh(interaction)
 
 
 class FirstButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="先攻", style=discord.ButtonStyle.primary)
+    def __init__(self, selected: bool):
+        super().__init__(
+            label="先攻",
+            style=discord.ButtonStyle.primary if selected else discord.ButtonStyle.secondary,
+            row=2,
+        )
 
     async def callback(self, interaction: discord.Interaction):
         view: SensekiFlowView = self.view
         view.is_first = True
-        view.show_win_lose()
-        await interaction.response.edit_message(
-            content=view.screen("結果を選んでください。"),
-            view=view,
-        )
+        await view.refresh(interaction)
 
 
 class SecondButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(label="後攻", style=discord.ButtonStyle.secondary)
+    def __init__(self, selected: bool):
+        super().__init__(
+            label="後攻",
+            style=discord.ButtonStyle.primary if selected else discord.ButtonStyle.secondary,
+            row=2,
+        )
 
     async def callback(self, interaction: discord.Interaction):
         view: SensekiFlowView = self.view
         view.is_first = False
-        view.show_win_lose()
-        await interaction.response.edit_message(
-            content=view.screen("結果を選んでください。"),
-            view=view,
-        )
+        await view.refresh(interaction)
 
 
 class WinButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="勝ち", style=discord.ButtonStyle.success)
+        super().__init__(label="勝ち", style=discord.ButtonStyle.success, row=3)
 
     async def callback(self, interaction: discord.Interaction):
         view: SensekiFlowView = self.view
@@ -1727,7 +2068,7 @@ class WinButton(discord.ui.Button):
 
 class LoseButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="負け", style=discord.ButtonStyle.danger)
+        super().__init__(label="負け", style=discord.ButtonStyle.danger, row=3)
 
     async def callback(self, interaction: discord.Interaction):
         view: SensekiFlowView = self.view
@@ -1736,21 +2077,48 @@ class LoseButton(discord.ui.Button):
 
 class RepeatButton(discord.ui.Button):
     def __init__(self):
-        super().__init__(label="同じ設定でもう1試合", style=discord.ButtonStyle.primary)
+        super().__init__(label="同じ設定でもう1試合", style=discord.ButtonStyle.primary, row=0)
 
     async def callback(self, interaction: discord.Interaction):
         view: SensekiFlowView = self.view
-        view.reset()
-        await interaction.response.edit_message(
-            content=view.screen("相手クラスを選択してください。"),
-            view=view,
-        )
+        view.opp_class = None
+        view.opp_deck = None
+        view.is_first = None
+        await view.refresh(interaction)
+
+
+class UndoButton(discord.ui.Button):
+    """記録完了画面から、今記録した1件だけを取り消す"""
+
+    def __init__(self, match_id: int):
+        super().__init__(label="今の記録を取り消す", style=discord.ButtonStyle.secondary, row=0)
+        self.match_id = match_id
+
+    async def callback(self, interaction: discord.Interaction):
+        view: SensekiFlowView = self.view
+        deleted = await delete_match_by_id(view.user_id, self.match_id)
+        if deleted is None:
+            notice = "⚠️ この記録は既に取り消されているため、何もしていません。"
+        else:
+            notice = "🗑️ 今の記録を取り消しました。選び直して、もう一度勝敗を押してください。"
+        # 取り消した試合の選択内容は残したまま入力画面に戻す（勝敗の押し間違いをすぐ直せる）
+        await view.refresh(interaction, notice=notice)
+
+
+class FlowSettingsButton(discord.ui.Button):
+    """記録画面から設定メニューを開く。記録時に設定を読み直すので、変えたらそのまま記録できる"""
+
+    def __init__(self):
+        super().__init__(label="設定を変える", emoji="⚙️", style=discord.ButtonStyle.secondary, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        await send_settings_menu(interaction)
 
 
 class SensekiFlowView(discord.ui.View):
     def __init__(self, user_id: str, settings: dict, origin_interaction: discord.Interaction):
-        # 13分。実際の対戦(5〜15分程度)をまたいで「同じ設定でもう1試合」を押せるように、
-        # 以前の5分から延長。Discordのフォローアップ編集が可能な15分に収まる範囲で設定。
+        # 13分。Discordのフォローアップ編集が可能な15分に収まる範囲で設定。
+        # 長い試合で時間切れになっても、選んだ内容は一時保存から復元できる。
         super().__init__(timeout=780)
         self.user_id = user_id
         self.settings = settings
@@ -1758,8 +2126,20 @@ class SensekiFlowView(discord.ui.View):
         self.opp_class = None
         self.opp_deck = None
         self.is_first = None
-        self.clear_items()
-        self.add_item(OpponentClassSelect())
+        self.restored = False
+        self._deck_cache: dict[str, list[str]] = {}
+
+    @classmethod
+    async def create(cls, user_id: str, settings: dict, origin_interaction: discord.Interaction):
+        view = cls(user_id, settings, origin_interaction)
+        draft = _load_flow_draft(user_id, settings)
+        if draft is not None:
+            view.opp_class = draft["opp_class"]
+            view.opp_deck = draft["opp_deck"]
+            view.is_first = draft["is_first"]
+            view.restored = True
+        await view.build()
+        return view
 
     def describe_settings(self) -> str:
         """今の自分の設定。全ステップで出し続けて、古いまま記録するのを防ぐ"""
@@ -1773,6 +2153,17 @@ class SensekiFlowView(discord.ui.View):
             rank += "・グレードなし"
         return f"🧑 あなた：**{deck}**（{s['my_class']} / {fmt}） / ランク：**{rank}**"
 
+    def describe_progress(self) -> str:
+        """ここまでに選んだ内容を1行で"""
+        if self.opp_class is None and self.is_first is None:
+            return ""
+        label = f"🆚 相手：**{self.opp_class or '未選択'}**"
+        if self.opp_deck:
+            label += f"（{self.opp_deck}）"
+        if self.is_first is not None:
+            label += f" / **{'先攻' if self.is_first else '後攻'}**"
+        return label
+
     def screen(self, body: str) -> str:
         """設定ヘッダー＋進捗＋操作案内をまとめた画面テキスト"""
         parts = [self.describe_settings()]
@@ -1783,39 +2174,66 @@ class SensekiFlowView(discord.ui.View):
         parts.append(body)
         return "\n".join(parts)
 
-    def describe_progress(self) -> str:
-        """ここまでに選んだ内容を1行で"""
+    def guide_text(self, notice: str = None) -> str:
+        lines = []
+        if notice:
+            lines.append(notice)
+        if self.opp_class is not None and self.is_first is not None:
+            lines.append("準備OKです。試合が終わったら **④ 勝ち／負け** を押してください。")
+            lines.append("-# 相手のデッキが分かったら、勝敗を押す前に②で選べます（任意）。")
+        else:
+            lines.append(
+                "試合開始時に **①相手クラス** と **③先攻／後攻** を選び、"
+                "試合が終わったら **④勝ち／負け** を押してください。"
+            )
+            lines.append("-# ②相手デッキは、分かったときだけ選べばOKです。")
+        return "\n".join(lines)
+
+    async def _known_decks(self) -> list[str]:
         if self.opp_class is None:
-            return ""
-        label = f"🆚 相手：**{self.opp_class}**"
-        if self.opp_deck:
-            label += f"（{self.opp_deck}）"
-        if self.is_first is not None:
-            label += f" / **{'先攻' if self.is_first else '後攻'}**"
-        return label
+            return []
+        if self.opp_class not in self._deck_cache:
+            self._deck_cache[self.opp_class] = await get_deck_names(self.opp_class)
+        return self._deck_cache[self.opp_class]
 
-    def show_opponent_deck(self, known_decks: list[str]):
+    async def build(self):
+        """選択状態に合わせて入力画面の部品を並べ直す"""
         self.clear_items()
-        self.add_item(OpponentDeckSelect(known_decks))
-
-    def show_first_second(self):
-        self.clear_items()
-        self.add_item(FirstButton())
-        self.add_item(SecondButton())
-
-    def show_win_lose(self):
-        self.clear_items()
+        self.add_item(OpponentClassSelect(self.opp_class))
+        self.add_item(OpponentDeckSelect(
+            await self._known_decks(), self.opp_deck, enabled=self.opp_class is not None,
+        ))
+        self.add_item(FirstButton(self.is_first is True))
+        self.add_item(SecondButton(self.is_first is False))
         self.add_item(WinButton())
         self.add_item(LoseButton())
+        self.add_item(FlowSettingsButton())
 
-    def reset(self):
-        self.opp_class = None
-        self.opp_deck = None
-        self.is_first = None
-        self.clear_items()
-        self.add_item(OpponentClassSelect())
+    async def refresh(self, interaction: discord.Interaction, notice: str = None):
+        await self.build()
+        _save_flow_draft(self)
+        await interaction.response.edit_message(
+            content=self.screen(self.guide_text(notice)), view=self,
+        )
 
     async def finalize(self, interaction: discord.Interaction, is_win: bool):
+        missing = []
+        if self.opp_class is None:
+            missing.append("①相手クラス")
+        if self.is_first is None:
+            missing.append("③先攻／後攻")
+        if missing:
+            await self.refresh(
+                interaction,
+                notice=f"⚠️ まだ記録していません。{'と'.join(missing)}を選んでから勝敗を押してください。",
+            )
+            return
+
+        # 記録画面を開いたあとに「⚙️ 設定を変える」でデッキやランクを変えた場合に備え、
+        # 記録の直前に最新の設定を読み直す（古い設定のまま記録されるのを防ぐ）
+        latest = await get_user_settings(self.user_id)
+        if latest is not None:
+            self.settings = latest
         match_id = await insert_match(
             self.user_id, self.settings, self.opp_class, self.opp_deck,
             self.is_first, is_win,
@@ -1827,14 +2245,16 @@ class SensekiFlowView(discord.ui.View):
         if variant_label:
             await insert_personal_variant(match_id, self.user_id, variant_label)
 
+        _clear_flow_draft(self.user_id)
         result_label = "勝ち" if is_win else "負け"
         self.clear_items()
         self.add_item(RepeatButton())
+        self.add_item(UndoButton(match_id))
         tag_note = f"\n🏷 検証タグ「{variant_label}」を付けて記録しました。" if variant_label else ""
         await interaction.response.edit_message(
             content=self.screen(
                 f"✅ **{result_label}** で記録しました。{tag_note}\n"
-                f"続けて記録する場合は下のボタンを押してください。"
+                f"続けて記録する場合は「同じ設定でもう1試合」、押し間違えた場合は「今の記録を取り消す」を押してください。"
             ),
             view=self,
         )
@@ -1842,14 +2262,18 @@ class SensekiFlowView(discord.ui.View):
     async def on_timeout(self):
         # 元のインタラクションのフォローアップ編集は15分まで有効。
         # timeout=780(13分)なので基本は成功するが、念のためHTTPExceptionは握りつぶす。
-        try:
-            await self.origin_interaction.edit_original_response(
-                content=(
-                    "⏱ 入力の受付時間が終了しました。\n"
-                    "お手数ですが、パネルの「⚔️ 戦績を記録する」からもう一度お願いします。"
-                ),
-                view=None,
+        if self.user_id in _FLOW_DRAFTS:
+            text = (
+                "⏱ 入力の受付時間が終了しました。\n"
+                "パネルの「⚔️ 戦績を記録する」から開き直すと、選んでいた内容から再開できます。"
             )
+        else:
+            text = (
+                "⏱ 入力の受付時間が終了しました。\n"
+                "お手数ですが、パネルの「⚔️ 戦績を記録する」からもう一度お願いします。"
+            )
+        try:
+            await self.origin_interaction.edit_original_response(content=text, view=None)
         except discord.HTTPException:
             pass
 
@@ -2369,7 +2793,7 @@ class PanelSetupButton(discord.ui.Button):
                 f"**{deck}**（{settings['my_class']} / "
                 f"{FORMAT_LABELS.get(settings['format'], settings['format'])}） / "
                 f"ランク：**{rank}**\n\n"
-                "デッキやランクを変えるだけなら「🔄 デッキ切替」「📈 ランク更新」が早いです。",
+                "デッキやランクを変えるだけなら「⚙️ 設定を変える」が早いです。",
                 view=view,
                 ephemeral=True,
             )
@@ -2440,22 +2864,6 @@ class PanelFormatButton(discord.ui.Button):
         )
 
 
-class PanelCheckButton(discord.ui.Button):
-    def __init__(self):
-        super().__init__(
-            label="成績確認",
-            style=discord.ButtonStyle.secondary,
-            emoji="📊",
-            custom_id=PANEL_CHECK_CUSTOM_ID,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        cog = interaction.client.get_cog("SensekiCog")
-        if cog is None:
-            await interaction.response.send_message("内部エラーです。", ephemeral=True)
-            return
-        await cog._show_check(interaction)
-
 
 class PanelWeakButton(discord.ui.Button):
     def __init__(self):
@@ -2475,6 +2883,8 @@ class PanelWeakButton(discord.ui.Button):
 
 
 PANEL_VARIANT_CUSTOM_ID = "senseki_panel_variant_v1"
+PANEL_SETTINGS_CUSTOM_ID = "senseki_panel_settings_v1"
+PANEL_AI_CUSTOM_ID = "senseki_panel_ai_v1"
 
 
 class VariantTagModal(discord.ui.Modal, title="検証タグを設定"):
@@ -2502,7 +2912,7 @@ class VariantTagModal(discord.ui.Modal, title="検証タグを設定"):
             f"🏷 検証タグ「{label}」を開始しました。\n"
             f"これ以降、**{self.settings['my_deck']}**で記録する対戦に自動で付与されます"
             f"（この記録はあなたにしか見えません）。\n"
-            f"やめる場合はもう一度「🧪 デッキ検証」→「タグを解除」を押してください。",
+            f"やめる場合は「⚙️ 設定を変える」→「🧪 デッキ検証」→「タグを解除」を押してください。",
             ephemeral=True,
         )
 
@@ -2583,7 +2993,7 @@ class PanelVariantButton(discord.ui.Button):
         settings = await get_user_settings(str(interaction.user.id))
         if settings is None or not settings.get("my_deck"):
             await interaction.response.send_message(
-                "まず「🆕 初回設定」か「🔄 デッキ切替」でデッキを登録してください。",
+                "まず「🆕 初回設定」か「⚙️ 設定を変える」→「🔄 デッキ切替」でデッキを登録してください。",
                 ephemeral=True,
             )
             return
@@ -2604,18 +3014,142 @@ class PanelVariantButton(discord.ui.Button):
         )
 
 
+class _SubmenuButton(discord.ui.Button):
+    """設定メニュー内のボタン。パネルの既存ボタンと同じ処理を呼ぶ（custom_idは持たない）"""
+
+    def __init__(self, label: str, emoji: str, handler):
+        super().__init__(label=label, emoji=emoji, style=discord.ButtonStyle.secondary)
+        self.handler = handler
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.handler(self, interaction)
+
+
+async def send_settings_menu(interaction: discord.Interaction):
+    """「⚙️ 設定を変える」：デッキ・ランク・フォーマット・検証タグの入口をまとめて出す"""
+    settings = await get_user_settings(str(interaction.user.id))
+    if settings is None:
+        await interaction.response.send_message("先に「🆕 初回設定」を済ませてください。", ephemeral=True)
+        return
+    view = discord.ui.View(timeout=180)
+    view.add_item(_SubmenuButton("デッキ切替", "🔄", PanelDeckSwitchButton.callback))
+    view.add_item(_SubmenuButton("ランク更新", "📈", PanelRankUpdateButton.callback))
+    view.add_item(_SubmenuButton("フォーマット切替", "🔀", PanelFormatButton.callback))
+    view.add_item(_SubmenuButton("デッキ検証", "🧪", PanelVariantButton.callback))
+    deck = settings.get("my_deck") or "デッキ未設定"
+    rank = settings.get("rank_tier") or "ランク未設定"
+    if settings.get("cr_grade"):
+        rank += f"・{settings['cr_grade']}"
+    await interaction.response.send_message(
+        f"⚙️ 今の設定：**{deck}**（{settings['my_class']} / "
+        f"{FORMAT_LABELS.get(settings['format'], settings['format'])}） / ランク：**{rank}**\n"
+        "変えたい項目を選んでください。\n"
+        "-# 🧪 デッキ検証：今のデッキに自分だけの検証タグを付けて、型ごとの勝率を比べられます。",
+        view=view,
+        ephemeral=True,
+    )
+
+
+class PanelSettingsButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="設定を変える", style=discord.ButtonStyle.secondary, emoji="⚙️",
+            custom_id=PANEL_SETTINGS_CUSTOM_ID,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await send_settings_menu(interaction)
+
+
+class _FollowupInteraction:
+    """
+    すでに返信済みのインタラクションで、もう1通メッセージを送るための薄いラッパー。
+    response.send_message を followup.send に置き換え、それ以外は元のインタラクションに任せる。
+    「📊 成績・弱点」で、成績と弱点対面を続けて表示するために使う。
+    """
+
+    class _Response:
+        def __init__(self, interaction):
+            self._i = interaction
+
+        async def send_message(self, content=None, **kwargs):
+            kwargs.setdefault("ephemeral", True)
+            await self._i.followup.send(content, **kwargs)
+
+
+    def __init__(self, interaction):
+        self._interaction = interaction
+        self.response = self._Response(interaction)
+
+    def __getattr__(self, name):
+        return getattr(self._interaction, name)
+
+
+class PanelCheckButton(discord.ui.Button):
+    """成績確認と弱点対面をまとめた入口"""
+
+    def __init__(self):
+        super().__init__(
+            label="成績・弱点",
+            style=discord.ButtonStyle.secondary,
+            emoji="📊",
+            custom_id=PANEL_CHECK_CUSTOM_ID,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("SensekiCog")
+        if cog is None:
+            await interaction.response.send_message("内部エラーです。", ephemeral=True)
+            return
+        await cog._show_check(interaction)
+        # 記録があるときだけ、続けて弱点対面を出す（記録が無い人に同じ案内を2回出さない）
+        settings = await get_user_settings(str(interaction.user.id))
+        if settings and settings.get("my_deck"):
+            total = await get_deck_total(str(interaction.user.id), settings["format"], settings["my_deck"])
+            if total > 0:
+                await cog._show_weak_matchups(_FollowupInteraction(interaction))
+
+
+class PanelAIButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(
+            label="AIで分析", style=discord.ButtonStyle.secondary, emoji="🤖",
+            custom_id=PANEL_AI_CUSTOM_ID,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        cog = interaction.client.get_cog("SensekiCog")
+        if cog is None:
+            await interaction.response.send_message("内部エラーです。", ephemeral=True)
+            return
+        await cog._show_personal_ai(interaction)
+
+
 class SensekiPanelView(discord.ui.View):
     """timeout=None＋固定custom_idで永続化。BOT再起動後もボタンが反応し続ける"""
 
     def __init__(self):
         super().__init__(timeout=None)
-        # 1段目：記録まわり（よく使う順）
+        # 1段目：記録と確認
         self.add_item(SensekiPanelButton())
         self.add_item(PanelUndoButton())
         self.add_item(PanelCheckButton())
-        self.add_item(PanelWeakButton())
-        # 2段目：設定まわり
+        self.add_item(PanelAIButton())
+        # 2段目：設定
         self.add_item(PanelSetupButton())
+        self.add_item(PanelSettingsButton())
+
+
+class LegacyPanelView(discord.ui.View):
+    """
+    以前のパネルにだけあったボタン（弱点対面・デッキ切替・ランク更新・フォーマット切替・デッキ検証）。
+    新しいパネルを設置し直すまでの間、古いパネルのボタンも動くように登録だけしておく。
+    古いパネルを削除したら、このクラスと cog_load の登録行は消してよい。
+    """
+
+    def __init__(self):
+        super().__init__(timeout=None)
+        self.add_item(PanelWeakButton())
         self.add_item(PanelDeckSwitchButton())
         self.add_item(PanelRankUpdateButton())
         self.add_item(PanelFormatButton())
@@ -2689,6 +3223,288 @@ def build_workbook(matches: list[dict], guild) -> bytes:
 
 
 # ==============================
+# 環境レポートの画像（デッキ単位・直感的に読める形）
+# ==============================
+# ・よく当たるデッキ TOP10（当たる割合・勝ちやすさ・直近の増減）
+# ・環境マップ（横：当たる割合／縦：勝ちにくさ）
+# ・デッキ相性表（上位8デッキ同士。30戦以上のマスだけ有利/不利を判定）
+# いずれもローテーションのみ。使用率は相手側、勝ちやすさは記録者平均との差で見る。
+
+REPORT_TOP_DECKS = 10           # ランキング・環境マップに載せる相手デッキ数
+REPORT_MATRIX_DECKS = 8         # 相性表に載せるデッキ数
+REPORT_MATRIX_MIN_SHOW = 10     # これ未満の組み合わせは「−」
+REPORT_MATRIX_MIN_JUDGE = 30    # これ以上の組み合わせだけ有利/不利を判定
+REPORT_FAVOR = 55.0             # 有利とみなす勝率
+REPORT_UNFAVOR = 45.0           # 不利とみなす勝率
+
+CLASS_COLORS = {
+    "エルフ": "#5DAA4F", "ロイヤル": "#D4A72C", "ウィッチ": "#6F5BD9",
+    "ドラゴン": "#D9653B", "ナイトメア": "#A23B6B", "ビショップ": "#9AA3B5",
+    "ネメシス": "#3B8FD9",
+}
+
+
+def _parse_recorded(r, default):
+    try:
+        return datetime.fromisoformat(r["recorded_at"])
+    except (TypeError, ValueError, KeyError):
+        return default
+
+
+def compute_report_data(matches: list[dict], now: datetime):
+    """環境レポートの画像とAI分析に使う集計（ローテーションのみ）。記録が無ければ None"""
+    rows = [m for m in matches if m.get("format") == "rotation"]
+    if not rows:
+        return None
+    n = len(rows)
+    avg = sum(1 for r in rows if r["is_win"]) / n * 100
+    with_deck = [r for r in rows if r.get("opp_deck")]
+
+    # 直近の期間（試合数が少なければ倍に広げる）
+    for days in (ENV_REPORT_AI_RECENT_DAYS, ENV_REPORT_AI_RECENT_DAYS * 2):
+        cutoff = now - timedelta(days=days)
+        recent = [r for r in with_deck if _parse_recorded(r, now) >= cutoff]
+        before = [r for r in with_deck if _parse_recorded(r, now) < cutoff]
+        if len(recent) >= 30:
+            break
+
+    def key(r):
+        return (r["opp_class"], r["opp_deck"])
+
+    total_c, win_c, rec_c, bef_c = {}, {}, {}, {}
+    for r in with_deck:
+        k = key(r)
+        total_c[k] = total_c.get(k, 0) + 1
+        win_c[k] = win_c.get(k, 0) + (1 if r["is_win"] else 0)
+    for r in recent:
+        rec_c[key(r)] = rec_c.get(key(r), 0) + 1
+    for r in before:
+        bef_c[key(r)] = bef_c.get(key(r), 0) + 1
+
+    items = []
+    for k, cnt in sorted(total_c.items(), key=lambda kv: -kv[1])[:REPORT_TOP_DECKS]:
+        win_rate = win_c[k] / cnt * 100
+        trend = None
+        if len(recent) >= 30 and len(before) >= 30:
+            trend = rec_c.get(k, 0) / len(recent) * 100 - bef_c.get(k, 0) / len(before) * 100
+        items.append({
+            "cls": k[0], "deck": k[1], "n": cnt,
+            "share": cnt / len(with_deck) * 100,
+            "diff": win_rate - avg, "trend": trend, "recent_n": rec_c.get(k, 0),
+        })
+
+    # デッキ相性（使った側・当たった側の記録を合算）
+    pair_t, pair_w = {}, {}
+    for r in rows:
+        if not r.get("opp_deck") or not r.get("my_deck"):
+            continue
+        a = (r["my_class"], r["my_deck"])
+        b = (r["opp_class"], r["opp_deck"])
+        w = 1 if r["is_win"] else 0
+        pair_t[(a, b)] = pair_t.get((a, b), 0) + 1
+        pair_w[(a, b)] = pair_w.get((a, b), 0) + w
+        pair_t[(b, a)] = pair_t.get((b, a), 0) + 1
+        pair_w[(b, a)] = pair_w.get((b, a), 0) + (1 - w)
+    top = [(it["cls"], it["deck"]) for it in items[:REPORT_MATRIX_DECKS]]
+    matrix = []
+    for a in top:
+        row = []
+        for b in top:
+            t = pair_t.get((a, b), 0)
+            row.append({"n": t, "rate": (pair_w.get((a, b), 0) / t * 100) if t else None})
+        matrix.append(row)
+
+    firsts = {}
+    for flag in (1, 0):
+        rs = [r for r in rows if r["is_first"] == flag]
+        if rs:
+            firsts[flag] = (len(rs), sum(1 for r in rs if r["is_win"]) / len(rs) * 100)
+
+    return {
+        "n": n, "n_deck": len(with_deck), "avg": avg, "items": items,
+        "recent_days": days, "recent_n": len(recent),
+        "matrix_decks": top, "matrix": matrix, "firsts": firsts,
+    }
+
+
+def _report_badge(diff: float):
+    if diff >= 5:
+        return "◎ 勝てている", "#2E8B57"
+    if diff >= -2:
+        return "○ ふつう", "#7A7A7A"
+    if diff >= -6:
+        return "△ やや苦戦", "#D08A1E"
+    return "× 苦戦", "#C2402F"
+
+
+def _fig_to_buf(fig):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def render_deck_ranking(data: dict, date_label: str):
+    """よく当たるデッキ TOP10 の表"""
+    items = data["items"]
+    if plt is None or _JP_FONT_NAME is None or not items:
+        return None
+    try:
+        height = 2.4 + 0.5 * len(items)
+        fig = plt.figure(figsize=(8, height), dpi=150)
+        ax = fig.add_axes([0, 0, 1, 1])
+        ax.axis("off")
+        ax.set_xlim(0, 100)
+        total_h = 14 + 7 * len(items) + 12
+        ax.set_ylim(0, total_h)
+        top_y = total_h - 4
+        ax.text(4, top_y, "今の環境　よく当たるデッキ TOP" + str(len(items)), fontsize=17, weight="bold", va="center")
+        ax.text(4, top_y - 4.5, f"ローテーション・相手デッキ{data['n_deck']}戦から集計（{date_label}時点）",
+                fontsize=10, color="#666", va="center")
+        hdr = top_y - 9
+        for x, t in ((4, "順位・デッキ"), (52, "当たる割合"), (77, "勝ちやすさ"), (90, "直近")):
+            ax.text(x, hdr, t, fontsize=9.5, color="#888", va="center")
+        y = hdr - 6
+        mx = max(it["share"] for it in items)
+        for i, it in enumerate(items, 1):
+            if i % 2:
+                ax.add_patch(plt.Rectangle((2, y - 3.2), 96, 6.4, color="#F6F6F4", zorder=0))
+            color = CLASS_COLORS.get(it["cls"], "#999999")
+            ax.text(4, y, str(i), fontsize=13, weight="bold", va="center")
+            ax.add_patch(plt.Rectangle((8.5, y - 2), 1.3, 4, color=color))
+            t1 = ax.text(11.5, y, it["deck"], fontsize=12.5, va="center")
+            ax.annotate(it["cls"], xycoords=t1, xy=(1, 0.5), xytext=(6, 0), textcoords="offset points",
+                        fontsize=9, color="#888", va="center")
+            w = it["share"] / mx * 16
+            ax.add_patch(plt.Rectangle((52, y - 1.4), w, 2.8, color=color, alpha=0.85))
+            ax.text(52 + w + 1, y, f"{it['share']:.1f}%", fontsize=10, va="center")
+            label, c = _report_badge(it["diff"])
+            ax.text(77, y, label, fontsize=10.5, color=c, va="center", weight="bold")
+            if it["trend"] is None or it["recent_n"] < 10:
+                a, ac = "ー", "#999999"
+            elif it["trend"] >= 3:
+                a, ac = "▲", "#C2402F"
+            elif it["trend"] <= -3:
+                a, ac = "▼", "#3B6FD9"
+            else:
+                a, ac = "→", "#777777"
+            ax.text(92, y, a, fontsize=12, color=ac, va="center", ha="center")
+            y -= 7
+        ax.text(4, 7, f"勝ちやすさ：記録者全体の平均勝率（{data['avg']:.0f}%）との差　"
+                      "◎+5以上／○−2〜+5／△−2〜−6／×−6以下", fontsize=8.5, color="#666")
+        ax.text(4, 3, f"直近：{data['recent_days']}日間で当たる割合が ▲増えた／▼減った（3ポイント以上）。"
+                      "記録が少ないものは「ー」", fontsize=8.5, color="#666")
+        return _fig_to_buf(fig)
+    except Exception as e:
+        print(f"⚠️ デッキランキング画像の生成に失敗: {type(e).__name__}: {e}")
+        return None
+
+
+def render_env_map(data: dict):
+    """環境マップ（横：当たる割合／縦：勝ちにくさ）"""
+    items = data["items"]
+    if plt is None or _JP_FONT_NAME is None or len(items) < 3:
+        return None
+    try:
+        fig, ax = plt.subplots(figsize=(8, 6.6), dpi=150)
+        xs = [it["share"] for it in items]
+        ys = [-it["diff"] for it in items]
+        ax.axvline(sum(xs) / len(xs), color="#bbbbbb", lw=1, ls="--")
+        ax.axhline(0, color="#bbbbbb", lw=1, ls="--")
+        max_n = max(it["n"] for it in items)
+        for it in items:
+            size = 120 + 700 * it["n"] / max_n
+            ax.scatter(it["share"], -it["diff"], s=size, color=CLASS_COLORS.get(it["cls"], "#999999"),
+                       alpha=0.75, edgecolor="white", lw=1.5, zorder=3)
+            ax.annotate(it["deck"], (it["share"], -it["diff"]), xytext=(0, 9 + (size ** 0.5) / 2),
+                        textcoords="offset points", ha="center", fontsize=10.5)
+        lim = max(abs(v) for v in ys) + 4
+        ax.set_ylim(-lim, lim)
+        ax.set_xlim(min(xs) - 2, max(xs) + 2.5)
+        x_l, x_r = min(xs) - 1.6, max(xs) + 2.2
+        ax.text(x_r, lim - 1, "よく当たる＆苦戦\n＝最優先で対策", ha="right", va="top", fontsize=11, color="#C2402F", weight="bold")
+        ax.text(x_l, lim - 1, "たまに当たる＆苦戦\n＝見かけたら注意", ha="left", va="top", fontsize=10, color="#D08A1E")
+        ax.text(x_r, -lim + 1, "よく当たる＆勝てている", ha="right", va="bottom", fontsize=10, color="#2E8B57")
+        ax.text(x_l, -lim + 1, "たまに当たる＆勝てている", ha="left", va="bottom", fontsize=10, color="#888888")
+        ax.set_xlabel("当たる割合（%）→ 多い", fontsize=11)
+        ax.text(-0.03, 0.98, "勝ちにくい ↑", transform=ax.transAxes, rotation=90, ha="right", va="top", fontsize=11)
+        ax.text(-0.03, 0.02, "↓ 勝ちやすい", transform=ax.transAxes, rotation=90, ha="right", va="bottom", fontsize=11)
+        ax.set_yticks([])
+        ax.set_title("環境マップ：どのデッキを対策すべきか", fontsize=15, pad=12)
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        fig.text(0.5, 0.005, f"縦軸は記録者全体の平均勝率（{data['avg']:.0f}%）との差。円の大きさは試合数",
+                 ha="center", fontsize=8.5, color="#666")
+        fig.tight_layout(rect=(0, 0.02, 1, 1))
+        return _fig_to_buf(fig)
+    except Exception as e:
+        print(f"⚠️ 環境マップ画像の生成に失敗: {type(e).__name__}: {e}")
+        return None
+
+
+def render_deck_matrix(data: dict):
+    """デッキ相性表（左のデッキから見た勝率）"""
+    decks = data["matrix_decks"]
+    if plt is None or _JP_FONT_NAME is None or len(decks) < 3:
+        return None
+    try:
+        k = len(decks)
+        judged = [[float("nan")] * k for _ in range(k)]
+        ref = [[float("nan")] * k for _ in range(k)]
+        for i in range(k):
+            for j in range(k):
+                c = data["matrix"][i][j]
+                if i == j or c["rate"] is None:
+                    continue
+                if c["n"] >= REPORT_MATRIX_MIN_JUDGE:
+                    judged[i][j] = c["rate"]
+                elif c["n"] >= REPORT_MATRIX_MIN_SHOW:
+                    ref[i][j] = c["rate"]
+
+        import numpy as _np
+        cmap = matplotlib.colormaps["RdYlGn"].copy()
+        cmap.set_bad("#EEEEEE")
+        fig, ax = plt.subplots(figsize=(1.1 * k + 1.2, 1.0 * k + 1.6), dpi=150)
+        ax.imshow(_np.ma.masked_invalid(_np.array(judged)), cmap=cmap, vmin=25, vmax=75)
+        ax.imshow(_np.ma.masked_invalid(_np.array(ref)), cmap=cmap, vmin=25, vmax=75, alpha=0.35)
+        labels = [f"{d}\n{c}" for c, d in decks]
+        ax.set_xticks(range(k))
+        ax.set_yticks(range(k))
+        ax.set_xticklabels(labels, fontsize=9.5)
+        ax.set_yticklabels(labels, fontsize=10)
+        ax.xaxis.tick_top()
+        for i in range(k):
+            for j in range(k):
+                c = data["matrix"][i][j]
+                if i == j:
+                    ax.text(j, i, "同型", ha="center", va="center", fontsize=9, color="#999999")
+                elif c["n"] >= REPORT_MATRIX_MIN_JUDGE:
+                    v = c["rate"]
+                    mark = "有利" if v >= REPORT_FAVOR else "不利" if v <= REPORT_UNFAVOR else "互角"
+                    ax.text(j, i, f"{mark}\n{v:.0f}%({c['n']})", ha="center", va="center", fontsize=9.5,
+                            weight="bold" if mark != "互角" else "normal")
+                elif c["n"] >= REPORT_MATRIX_MIN_SHOW:
+                    ax.text(j, i, f"参考\n{c['rate']:.0f}%({c['n']})", ha="center", va="center", fontsize=9, color="#444444")
+                else:
+                    ax.text(j, i, f"−\n({c['n']})", ha="center", va="center", fontsize=8.5, color="#AAAAAA")
+        ax.set_title("デッキ相性表（左のデッキから見た勝率）", fontsize=15, pad=50)
+        fig.text(0.5, 0.035,
+                 f"よく当たるデッキ上位{k}つ。有利{REPORT_FAVOR:.0f}%以上／不利{REPORT_UNFAVOR:.0f}%以下"
+                 f"（{REPORT_MATRIX_MIN_JUDGE}戦以上のみ判定）",
+                 ha="center", fontsize=8.5, color="#666")
+        fig.text(0.5, 0.012,
+                 f"{REPORT_MATRIX_MIN_SHOW}〜{REPORT_MATRIX_MIN_JUDGE - 1}戦は薄い色の「参考」、"
+                 f"{REPORT_MATRIX_MIN_SHOW}戦未満は「−」。使った側・当たった側の記録を合算",
+                 ha="center", fontsize=8.5, color="#666")
+        fig.tight_layout(rect=(0, 0.06, 1, 1))
+        return _fig_to_buf(fig)
+    except Exception as e:
+        print(f"⚠️ デッキ相性表の生成に失敗: {type(e).__name__}: {e}")
+        return None
+
+
+# ==============================
 # Cog本体
 # ==============================
 
@@ -2735,6 +3551,10 @@ class SensekiCog(commands.Cog):
         print("-----------------------------------")
         if not self.weekly_export.is_running():
             self.weekly_export.start()
+        if not self.env_watch.is_running():
+            self.env_watch.start()
+        if not self.env_report_loop.is_running():
+            self.env_report_loop.start()
         if not self.daily_sheets_sync.is_running():
             self.daily_sheets_sync.start()
         if not self.debounced_sheets_sync.is_running():
@@ -2742,6 +3562,7 @@ class SensekiCog(commands.Cog):
         # 永続ビューの登録。custom_idが一致すれば、BOT再起動後も
         # 過去に送信済みのパネルのボタンが反応し続ける
         self.bot.add_view(SensekiPanelView())
+        self.bot.add_view(LegacyPanelView())
         # BOT再起動をまたいでも掲示板が最新になるよう一度更新しておく
         try:
             await self._update_board()
@@ -2750,6 +3571,8 @@ class SensekiCog(commands.Cog):
 
     def cog_unload(self):
         self.weekly_export.cancel()
+        self.env_watch.cancel()
+        self.env_report_loop.cancel()
         self.daily_sheets_sync.cancel()
         self.debounced_sheets_sync.cancel()
 
@@ -2799,15 +3622,16 @@ class SensekiCog(commands.Cog):
                     "\n"
                     "**記録・確認**\n"
                     "・⚔️ 戦績を記録する　・↩️ 直前の記録を取消\n"
-                    "・📊 成績確認　・📉 弱点対面\n"
+                    "・📊 成績・弱点（通算・直近の成績と、勝率が低い対面）\n"
+                    "・🤖 AIで分析（今のデッキの記録をAIが読み解く。1日1回）\n"
                     "\n"
                     "**設定**\n"
-                    "・🆕 初回設定　・🔄 デッキ切替（新規登録もここから）\n"
-                    "・📈 ランク更新　・🔀 フォーマット切替\n"
+                    "・🆕 初回設定\n"
+                    "・⚙️ 設定を変える（デッキ切替・ランク更新・フォーマット切替・デッキ検証）\n"
                     "\n"
                     "**⚠️ 記録の前に確認してください**\n"
                     "記録画面の上部に、今のあなたのデッキとランクが表示されます。\n"
-                    "**違っていたら「🔄 デッキ切替」「📈 ランク更新」で直してから記録してください。**\n"
+                    "**違っていたら記録画面の「⚙️ 設定を変える」で直してから記録してください。**\n"
                     "古い設定のまま記録すると、そのデータは集計に使えなくなります。\n"
                     "間違えたときは「↩️ 直前の記録を取消」で消せます。\n"
                     "\n"
@@ -2850,7 +3674,6 @@ class SensekiCog(commands.Cog):
 
     async def _build_board_embed(self) -> discord.Embed:
         all_settings = await fetch_all_user_settings()
-        guild = self.bot.get_guild(GUILD_ID)
         resolve = self._name_resolver()
 
         by_class: dict[str, list[str]] = {}
@@ -2959,7 +3782,7 @@ class SensekiCog(commands.Cog):
             senseki_sheets.sync_to_sheets,
             matches, FORMAT_LABELS, self._name_resolver(),
             class_summary, global_summary["by_first"],
-            matchup_rows, CLASS_CHOICES, MATCHUP_MATRIX_MIN_SAMPLE, CURRENT_ENV_ID,
+            matchup_rows, CLASS_CHOICES, MATCHUP_MATRIX_MIN_SAMPLE, current_env_id(),
         )
 
     @tasks.loop(time=dtime(hour=SHEETS_SYNC_HOUR, minute=SHEETS_SYNC_MINUTE, tzinfo=JST))
@@ -3105,6 +3928,15 @@ class SensekiCog(commands.Cog):
             f"\n戦績を記録したことがある人：{recorders}名\n"
             f"分析コマンドを使ったことがある人：{analyzers}名（記録者の{rate:.0f}%）"
         )
+        a = await get_activity_stats()
+        lines.append(
+            f"\n**記録した人数（目標100名）**\n"
+            f"・直近7日：{a['this_week_users']}名（{a['this_week_matches']}戦）\n"
+            f"・その前の7日：{a['last_week_users']}名（{a['last_week_matches']}戦）\n"
+            f"\n**🧪 デッキ検証**\n"
+            f"・タグ付きで記録したことがある人：{a['variant_users']}名（{a['variant_matches']}戦）\n"
+            f"・今タグを設定している人：{a['active_tag_users']}名"
+        )
         await interaction.response.send_message("\n".join(lines)[:1900], ephemeral=True)
 
     @admin.command(name="無料トライアル開始", description="初回参加者向け無料トライアルキャンペーンを開始します（このコマンド実行以降に初回登録した人だけが対象）")
@@ -3129,7 +3961,7 @@ class SensekiCog(commands.Cog):
             f"✅ 無料トライアルキャンペーンを開始しました（開始日時：{now[:19].replace('T', ' ')}）\n\n"
             f"これ以降に `/戦績 設定` を初めて実行した人だけが対象になります。\n"
             f"それ以前から使っている既存ユーザーは対象外です（今の環境は"
-            + ("引き続き全員無料のままです。" if PREMIUM_FREE_THIS_ENV else "既に有料化されています。")
+            + ("引き続き全員無料のままです。" if premium_free_this_env() else "既に有料化されています。")
             + f"）\nトライアル期間：{TRIAL_DAYS}日間",
             ephemeral=True,
         )
@@ -3159,7 +3991,7 @@ class SensekiCog(commands.Cog):
         await interaction.response.send_message(
             f"📅 無料トライアルキャンペーン開始日：{started[:19].replace('T', ' ')}\n"
             f"現在トライアル中の人数：{in_trial}名\n"
-            f"（現在の環境は" + ("全員無料のため、トライアルの有無に関わらず②が使えます。" if PREMIUM_FREE_THIS_ENV else "有料化済みです。") + "）",
+            f"（現在の環境は" + ("全員無料のため、トライアルの有無に関わらず②が使えます。" if premium_free_this_env() else "有料化済みです。") + "）",
             ephemeral=True,
         )
 
@@ -3262,11 +4094,11 @@ class SensekiCog(commands.Cog):
             ephemeral=True,
         )
 
-    async def _build_export(self, env_only: bool) -> tuple[bytes, str, int]:
-        matches = await fetch_all_matches(env_only=env_only)
+    async def _build_export(self, env_only: bool, env_id: str = None) -> tuple[bytes, str, int]:
+        matches = await fetch_all_matches(env_only=env_only, env_id=env_id)
         guild = self.bot.get_guild(GUILD_ID)
         data = await asyncio.to_thread(build_workbook, matches, guild)
-        scope = "現環境" if env_only else "全期間"
+        scope = (env_id or "現環境") if env_only else "全期間"
         filename = f"senseki_{scope}_{datetime.now(JST).strftime('%Y%m%d_%H%M')}.xlsx"
         return data, filename, len(matches)
 
@@ -3294,10 +4126,56 @@ class SensekiCog(commands.Cog):
     async def _before_weekly_export(self):
         await self.bot.wait_until_ready()
 
+    @tasks.loop(minutes=1)
+    async def env_watch(self):
+        """ENV_SCHEDULE の切替日時を過ぎたら、前の環境のデータを管理者にExcelで送る"""
+        now_env = current_env_id()
+        last_env = await get_state(ENV_STATE_KEY)
+        if last_env is None:
+            # 初回起動：今の環境を覚えるだけ
+            await set_state(ENV_STATE_KEY, now_env)
+            return
+        if last_env == now_env:
+            return
+
+        # 先に状態を更新して、送信に失敗しても毎分DMが飛び続けないようにする
+        await set_state(ENV_STATE_KEY, now_env)
+        print(f"🔄 戦績ツールの環境が切り替わりました：{last_env} → {now_env}")
+        mark_dirty()
+        try:
+            await self._update_board()
+        except Exception as e:
+            print(f"⚠️ 環境切替時の掲示板更新に失敗しました: {type(e).__name__}: {e}")
+
+        if SENSEKI_ADMIN_USER_ID == 0 or Workbook is None:
+            print("⚠️ 管理者IDまたはopenpyxlが無いため、前の環境のExcel送付をスキップしました")
+            return
+        try:
+            admin = self.bot.get_user(SENSEKI_ADMIN_USER_ID) or await self.bot.fetch_user(SENSEKI_ADMIN_USER_ID)
+            data, filename, count = await self._build_export(env_only=True, env_id=last_env)
+            await admin.send(
+                content=(
+                    f"🔄 戦績ツールの環境を切り替えました（{last_env} → {now_env}）\n"
+                    f"📊 前の環境のデータ（{count}件）を保存用にお送りします。\n"
+                    f"-# データは消していません。あとから `/戦績管理 データ抽出 前の環境:True` でも出力できます。"
+                ),
+                file=discord.File(io.BytesIO(data), filename=filename),
+            )
+        except Exception as e:
+            print(f"⚠️ 前の環境のExcel送付に失敗しました: {type(e).__name__}: {e}")
+
+    @env_watch.before_loop
+    async def _before_env_watch(self):
+        await self.bot.wait_until_ready()
+
     # ---- /戦績データ抽出 ----
     @admin.command(name="データ抽出", description="戦績データを生データ＋集計のExcelで出力します")
-    @app_commands.describe(全期間="オンにすると環境をまたいだ全データを出力します（既定は現環境のみ）")
-    async def senseki_export(self, interaction: discord.Interaction, 全期間: bool = False):
+    @app_commands.describe(
+        全期間="オンにすると環境をまたいだ全データを出力します（既定は現環境のみ）",
+        前の環境="オンにすると1つ前の環境（前の弾）のデータだけを出力します",
+    )
+    async def senseki_export(self, interaction: discord.Interaction,
+                             全期間: bool = False, 前の環境: bool = False):
         if Workbook is None:
             await interaction.response.send_message(
                 f"openpyxlが読み込めませんでした。\n```\n{OPENPYXL_IMPORT_ERROR}\n```\n"
@@ -3308,12 +4186,19 @@ class SensekiCog(commands.Cog):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            data, filename, count = await self._build_export(env_only=not 全期間)
+            target_env = None
+            if 前の環境 and not 全期間:
+                target_env = previous_env_id()
+                if target_env is None:
+                    await interaction.followup.send("1つ前の環境がありません。", ephemeral=True)
+                    return
+            data, filename, count = await self._build_export(env_only=not 全期間, env_id=target_env)
             if count == 0:
                 await interaction.followup.send("記録がまだありません。", ephemeral=True)
                 return
 
-            summary = f"📊 戦績データ抽出（{'全期間' if 全期間 else '現環境'}・{count}件）"
+            scope_label = "全期間" if 全期間 else (f"前の環境：{target_env}" if target_env else "現環境")
+            summary = f"📊 戦績データ抽出（{scope_label}・{count}件）"
             try:
                 await interaction.user.send(
                     content=summary,
@@ -3618,10 +4503,11 @@ class SensekiCog(commands.Cog):
             )
             return
 
-        view = SensekiFlowView(str(interaction.user.id), settings, interaction)
+        view = await SensekiFlowView.create(str(interaction.user.id), settings, interaction)
+        notice = "↩️ 前回選んでいた内容から再開します。" if view.restored else None
         await interaction.response.send_message(
             view.screen(
-                "相手クラスを選択してください。\n"
+                view.guide_text(notice) + "\n"
                 "-# 上の内容が違う場合は `/デッキ 切替` `/戦績 ランク更新` で変更してください。"
             ),
             view=view,
@@ -3713,59 +4599,6 @@ class SensekiCog(commands.Cog):
     # PNG画像としてDiscord上でいつでも見られるようにするためのもの。
     # 個人の弱点対面と違い母数が母集団全体なので誰でも使ってよい機能という位置づけ。
 
-    def _render_class_summary_image_sync(self, class_summary: list, env_id: str):
-        """クラス使用率（円）＋クラス別勝率（横棒）を1枚のPNGにする"""
-        if plt is None or _JP_FONT_NAME is None or not class_summary:
-            return None
-        try:
-            rows = sorted(class_summary, key=lambda r: r["total"], reverse=True)
-            labels = [r["my_class"] for r in rows]
-            totals = [r["total"] for r in rows]
-            win_rates = [
-                (r["wins"] or 0) / r["total"] * 100 if r["total"] else 0.0 for r in rows
-            ]
-
-            norm = mcolors.Normalize(vmin=0, vmax=100)
-            cmap = matplotlib.colormaps["RdYlGn"]
-
-            fig, (ax_pie, ax_bar) = plt.subplots(
-                2, 1, figsize=(7.4, 9.6), dpi=150,
-                gridspec_kw={"height_ratios": [1, 1.1]},
-            )
-
-            ax_pie.pie(totals, labels=labels, autopct="%1.1f%%", startangle=90,
-                       textprops={"fontsize": 11})
-            ax_pie.set_title(f"クラス使用率（現環境：{env_id}）", fontsize=14, pad=12)
-
-            # 勝率バーは勝率の低い順（悪い順）に並べ、悪目立ちする対面を上に来させる
-            bar_order = sorted(range(len(rows)), key=lambda i: win_rates[i], reverse=True)
-            bar_labels = [labels[i] for i in bar_order]
-            bar_values = [win_rates[i] for i in bar_order]
-            bar_totals = [totals[i] for i in bar_order]
-            colors = [cmap(norm(v)) for v in bar_values]
-
-            y = range(len(bar_labels))
-            ax_bar.barh(y, bar_values, color=colors, edgecolor="#333333", linewidth=0.5, height=0.65)
-            ax_bar.set_yticks(list(y))
-            ax_bar.set_yticklabels(bar_labels, fontsize=12)
-            ax_bar.set_xlim(0, 118)
-            ax_bar.set_xticks([0, 20, 40, 60, 80, 100])
-            ax_bar.axvline(50, color="#888888", linestyle="--", linewidth=1)
-            ax_bar.set_xlabel("勝率（%）", fontsize=11)
-            for yi, (v, t) in enumerate(zip(bar_values, bar_totals)):
-                ax_bar.text(v + 2, yi, f"{v:.1f}%（{t}戦）", va="center", ha="left", fontsize=10)
-            ax_bar.set_title(f"クラス別勝率（現環境：{env_id}）", fontsize=14, pad=12)
-            ax_bar.spines["top"].set_visible(False)
-            ax_bar.spines["right"].set_visible(False)
-
-            fig.tight_layout()
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png")
-            plt.close(fig)
-            buf.seek(0)
-            return buf
-        except Exception:
-            return None
 
     def _render_matchup_heatmap_sync(self, matchup_rows: list, classes: list,
                                       min_sample: int, env_id: str):
@@ -3839,49 +4672,6 @@ class SensekiCog(commands.Cog):
         except Exception:
             return None
 
-    def _render_first_second_image_sync(self, first_second_summary: list, env_id: str):
-        """先攻/後攻の勝率を横棒2本のPNGにする"""
-        if plt is None or _JP_FONT_NAME is None or not first_second_summary:
-            return None
-        try:
-            by_first = {r["is_first"]: r for r in first_second_summary}
-            order = [(1, "先攻"), (0, "後攻")]
-            labels, values, totals = [], [], []
-            for key, label in order:
-                r = by_first.get(key)
-                if r is None:
-                    continue
-                labels.append(label)
-                totals.append(r["total"])
-                values.append((r["wins"] or 0) / r["total"] * 100 if r["total"] else 0.0)
-
-            norm = mcolors.Normalize(vmin=0, vmax=100)
-            cmap = matplotlib.colormaps["RdYlGn"]
-            colors = [cmap(norm(v)) for v in values]
-
-            fig, ax = plt.subplots(figsize=(5.6, 3.6), dpi=150)
-            y = range(len(labels))
-            ax.barh(y, values, color=colors, edgecolor="#333333", linewidth=0.5, height=0.55)
-            ax.set_yticks(list(y))
-            ax.set_yticklabels(labels, fontsize=12)
-            ax.set_xlim(0, 118)
-            ax.set_xticks([0, 20, 40, 60, 80, 100])
-            ax.axvline(50, color="#888888", linestyle="--", linewidth=1)
-            ax.set_xlabel("勝率（%）", fontsize=11)
-            for yi, (v, t) in enumerate(zip(values, totals)):
-                ax.text(v + 2, yi, f"{v:.1f}%（{t}戦）", va="center", ha="left", fontsize=10)
-            ax.set_title(f"先攻/後攻の勝率（現環境：{env_id}）", fontsize=13, pad=12)
-            ax.spines["top"].set_visible(False)
-            ax.spines["right"].set_visible(False)
-            fig.tight_layout()
-
-            buf = io.BytesIO()
-            fig.savefig(buf, format="png")
-            plt.close(fig)
-            buf.seek(0)
-            return buf
-        except Exception:
-            return None
 
     async def _show_global_analysis(self, interaction: discord.Interaction):
         """環境分析コマンドの本体。SENSEKI_ADMIN_USER_ID 本人のみ実行できる"""
@@ -3892,27 +4682,10 @@ class SensekiCog(commands.Cog):
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        g = await get_global_summary()
+        g, files, _ = await self._build_env_report_files()
         if g["total"] == 0:
             await interaction.followup.send("まだ記録がありません。", ephemeral=True)
             return
-        matchup_rows = await get_class_matchup_matrix()
-        # クラス別集計はSheets同期側と同じく、自分が使った試合＋相手として対面した試合の対称合算
-        class_summary = combine_symmetric_class_stats(g["by_my_class"], g["by_opp_class"])
-
-        images = await asyncio.gather(
-            asyncio.to_thread(self._render_class_summary_image_sync, class_summary, CURRENT_ENV_ID),
-            asyncio.to_thread(
-                self._render_matchup_heatmap_sync, matchup_rows, CLASS_CHOICES,
-                MATCHUP_MATRIX_MIN_SAMPLE, CURRENT_ENV_ID,
-            ),
-            asyncio.to_thread(self._render_first_second_image_sync, g["by_first"], CURRENT_ENV_ID),
-        )
-        files = [
-            discord.File(buf, filename=name)
-            for buf, name in zip(images, ["クラス別集計.png", "対面マトリクス.png", "先攻後攻集計.png"])
-            if buf is not None
-        ]
 
         await log_command_usage(str(interaction.user.id), "環境分析")
 
@@ -3925,16 +4698,337 @@ class SensekiCog(commands.Cog):
             return
 
         await interaction.followup.send(
-            f"📊 **現環境（{CURRENT_ENV_ID}）の全体分析**（{g['total']}戦・記録者{g['users']}名）",
+            f"📊 **現環境（{current_env_id()}）の全体分析**（{g['total']}戦・記録者{g['users']}名）",
             files=files,
+            ephemeral=True,
+        )
+
+    async def _build_env_report_files(self):
+        """
+        現環境の集計と、レポート用の画像（discord.File）を返す。
+        戻り値：(全体集計 g, 画像のリスト, デッキ単位の集計 data or None)
+        画像は「よく当たるデッキTOP10」「環境マップ」「デッキ相性表」「クラス対面マトリクス」の順。
+        """
+        g = await get_global_summary()
+        if g["total"] == 0:
+            return g, [], None
+        matches = await fetch_all_matches(env_only=True)
+        now = datetime.now(JST)
+        data = compute_report_data(matches, now)
+        matchup_rows = await get_class_matchup_matrix()
+        date_label = now.strftime("%m/%d")
+
+        jobs = []
+        names = []
+        if data is not None:
+            jobs += [
+                asyncio.to_thread(render_deck_ranking, data, date_label),
+                asyncio.to_thread(render_env_map, data),
+                asyncio.to_thread(render_deck_matrix, data),
+            ]
+            names += ["よく当たるデッキ.png", "環境マップ.png", "デッキ相性表.png"]
+        jobs.append(asyncio.to_thread(
+            self._render_matchup_heatmap_sync, matchup_rows, CLASS_CHOICES,
+            MATCHUP_MATRIX_MIN_SAMPLE, current_env_id(),
+        ))
+        names.append("クラス対面マトリクス.png")
+        images = await asyncio.gather(*jobs)
+        files = [discord.File(buf, filename=name) for buf, name in zip(images, names) if buf is not None]
+        return g, files, data
+
+    # ---- 環境レポート（2日に1回、サーバーへ自動投稿） ----
+
+    async def _post_env_report(self, force: bool = False):
+        """
+        環境レポートを設置済みチャンネルに投稿する。
+        戻り値：(投稿したか, 理由メッセージ)
+        force=True のときは最低試合数のチェックを飛ばす（管理者の手動投稿用）
+        """
+        channel_id = await get_state(ENV_REPORT_CHANNEL_KEY)
+        if not channel_id:
+            return False, "投稿先が未設置です。`/戦績管理 環境レポート設置` を実行してください。"
+        channel = self.bot.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(int(channel_id))
+            except discord.HTTPException:
+                return False, "投稿先のチャンネルが見つかりません。設置し直してください。"
+
+        g, files, data = await self._build_env_report_files()
+        if g["total"] == 0:
+            return False, "現環境の記録がまだありません。"
+        if not force and g["total"] < ENV_REPORT_MIN_MATCHES:
+            return False, f"現環境の記録が{g['total']}戦で、投稿の目安（{ENV_REPORT_MIN_MATCHES}戦）に届いていません。"
+        if not files:
+            return False, "画像の生成に失敗しました。`/戦績管理 診断` を確認してください。"
+
+        env_id = current_env_id()
+        growth = ""
+        last = await get_state(ENV_REPORT_LAST_KEY)
+        if last:
+            try:
+                last_env, last_total, last_users = last.split("|")
+                if last_env == env_id:
+                    d_total = g["total"] - int(last_total)
+                    d_users = g["users"] - int(last_users)
+                    growth = f"（前回から +{max(d_total, 0)}戦・記録者 +{max(d_users, 0)}名）"
+            except ValueError:
+                pass
+
+        panel_id = await get_state(ENV_REPORT_PANEL_KEY)
+        discuss_id = await get_state(ENV_REPORT_DISCUSS_KEY)
+        if ENV_REPORT_CREATE_THREAD:
+            discuss_line = "💬 感想や考察は、下のスレッドへどうぞ！\n"
+        elif discuss_id:
+            discuss_line = f"💬 感想や考察は <#{discuss_id}> へどうぞ！\n"
+        else:
+            discuss_line = ""
+        where = f"<#{panel_id}> の" if panel_id else "戦績パネルの"
+        first_line = ""
+        if data and 1 in data["firsts"] and 0 in data["firsts"]:
+            (n1, r1), (n0, r0) = data["firsts"][1], data["firsts"][0]
+            first_line = f"先攻の勝率 **{r1:.1f}%**（{n1}戦）／後攻の勝率 **{r0:.1f}%**（{n0}戦）\n"
+
+        ai_text = await self._build_ai_commentary(g, data)
+        ai_block = ""
+        if ai_text:
+            ai_block = f"### 🤖 AIの読み解き\n{ai_text}\n{ENV_REPORT_AI_DISCLAIMER}\n\n"
+
+        content = (
+            f"## 📊 しろくさサーバー調べ：最新の環境レポート\n"
+            f"現環境（{env_id}）の記録 **{g['total']}戦**・記録者 **{g['users']}名**{growth}\n"
+            f"\n"
+            f"みなさんが記録した試合から、よく当たるデッキ・対策すべきデッキ・デッキ同士の相性を集計しました。\n"
+            f"{first_line}"
+            f"記録が増えるほど、このレポートの精度が上がります🙌\n"
+            f"\n"
+            f"{ai_block}"
+            f"⚔️ あなたの1戦も次回のレポートに反映されます → {where}「⚔️ 戦績を記録する」から\n"
+            f"{discuss_line}"
+            f"-# 集計はローテーションのみ。記録者の多いランク帯・デッキに偏る点はご了承ください。"
+        )
+        try:
+            message = await channel.send(content=content, files=files)
+        except discord.Forbidden:
+            return False, "投稿先のチャンネルにメッセージ・ファイルを送る権限がありません。"
+        thread_note = ""
+        if ENV_REPORT_CREATE_THREAD:
+            try:
+                await message.create_thread(
+                    name=f"{datetime.now(JST).strftime('%m/%d')} 環境レポートの感想・考察",
+                    auto_archive_duration=4320,  # 3日（次のレポートまで残る）
+                )
+            except discord.HTTPException as e:
+                thread_note = f"（スレッドは作れませんでした：BOTに「公開スレッドの作成」権限があるか確認してください / {type(e).__name__}）"
+        await set_state(ENV_REPORT_LAST_KEY, f"{env_id}|{g['total']}|{g['users']}")
+        await set_state(ENV_REPORT_LAST_DATE_KEY, datetime.now(JST).date().isoformat())
+        ai_note = "" if ai_text else "（AI分析は付けられませんでした。原因はRailwayのログで確認できます）"
+        return True, f"{channel.mention} に投稿しました（{g['total']}戦・記録者{g['users']}名）。{ai_note}{thread_note}"
+
+    async def _build_ai_commentary(self, g: dict, report_data: dict = None):
+        """集計値だけを渡して、AIに短い読み解きを書かせる。失敗したら None"""
+        api_key = os.environ.get(ENV_REPORT_AI_KEY_ENV)
+        if AsyncAnthropic is None or not api_key:
+            print(f"ℹ️ AI分析をスキップ：anthropic={ANTHROPIC_IMPORT_ERROR or 'OK'} / APIキー={'あり' if api_key else 'なし'}")
+            return None
+
+        matches = await fetch_all_matches(env_only=True)
+        data_text = build_ai_dataset(matches, current_env_id(), datetime.now(JST))
+        if data_text is None:
+            return None
+        if report_data:
+            pairs = []
+            decks = report_data["matrix_decks"]
+            for i, a in enumerate(decks):
+                for j, b in enumerate(decks):
+                    c = report_data["matrix"][i][j]
+                    if i < j and c["n"] >= REPORT_MATRIX_MIN_JUDGE:
+                        pairs.append(f"- {a[1]}（{a[0]}） 対 {b[1]}（{b[0]}）：{c['n']}戦・左から見た勝率{c['rate']:.1f}%")
+            data_text += (
+                f"\n\n■ デッキ同士の相性（{REPORT_MATRIX_MIN_JUDGE}戦以上の組み合わせのみ。"
+                f"使った側・当たった側の記録を合算しているので、平均との差ではなく50%を基準に読む）\n"
+                + ("\n".join(pairs) if pairs else "- （該当なし：まだ試合数が足りない）")
+            )
+
+        system = (
+            "あなたはシャドウバース ワールズビヨンドのDiscordコミュニティで、"
+            "メンバーが記録したランクマッチの対戦データを読み解く担当です。\n"
+            "【データの読み方】\n"
+            "- 環境の使用率は「相手側」の数字で判断する（相手はマッチングでランダムに当たるため）。"
+            "記録者自身のデッキの数は、記録者の好みに偏るので使用率として扱わない。\n"
+            "- 記録者は上位ランク帯が多く、全体の勝率が50%より高い。"
+            "勝ちやすさ・勝ちにくさは、必ず「記録者全体の平均勝率との差」で判断する。\n"
+            "- 「直近」と「それより前」の比較があれば、使用率が増えた・減ったものを優先して書く。"
+            "直近の試合数が100戦未満なら「兆し」「まだ断定できない」と表現する。\n"
+            "【厳守するルール】\n"
+            "1. 渡された数字だけを根拠にする。カード名・カードの効果・デッキの中身・強い理由には一切触れない"
+            "（データに含まれていないため。推測で書くと誤情報になる）。デッキ名は渡されたものをそのまま使う。\n"
+            "2. 30戦未満の数字には触れない。\n"
+            "3. 記録が一部の記録者に偏っている場合は、そのことを1回だけ短く添える。\n"
+            "4. 「最強」「環境トップ」「必ず勝てる」などの断定や煽りは使わない。\n"
+            "5. 日本語・だ・である調で、箇条書き4〜5個、全体で400字以内。見出しや前置き、締めの挨拶は書かない。\n"
+            "6. 最後の箇条書きは「次の記録で確かめたいこと」を1つ書く。"
+        )
+        try:
+            client = AsyncAnthropic(api_key=api_key, timeout=60)
+            msg = await client.messages.create(
+                model=ENV_REPORT_AI_MODEL,
+                max_tokens=700,
+                system=system,
+                messages=[{"role": "user", "content": f"次の集計を読み解いてください。\n\n{data_text}"}],
+            )
+            text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
+            if not text:
+                return None
+            # Discordの2000字制限に余裕を残す
+            return text[:900]
+        except Exception as e:
+            print(f"⚠️ 環境レポートのAI分析に失敗しました: {type(e).__name__}: {e}")
+            return None
+
+    @tasks.loop(time=dtime(hour=ENV_REPORT_HOUR, minute=ENV_REPORT_MINUTE, tzinfo=JST))
+    async def env_report_loop(self):
+        last_date = await get_state(ENV_REPORT_LAST_DATE_KEY)
+        if last_date:
+            try:
+                days = (datetime.now(JST).date() - datetime.fromisoformat(last_date).date()).days
+                if days < ENV_REPORT_INTERVAL_DAYS:
+                    return
+            except ValueError:
+                pass
+        try:
+            posted, reason = await self._post_env_report()
+            if not posted:
+                print(f"ℹ️ 環境レポートを投稿しませんでした: {reason}")
+        except Exception as e:
+            print(f"⚠️ 環境レポートの投稿に失敗しました: {type(e).__name__}: {e}")
+
+    @env_report_loop.before_loop
+    async def _before_env_report_loop(self):
+        await self.bot.wait_until_ready()
+
+    @admin.command(name="環境レポート設置", description="2日に1回12時に、環境レポートをこのチャンネルへ自動投稿します")
+    @app_commands.describe(
+        パネルのチャンネル="レポート内で「ここから記録」と案内する戦績パネルのチャンネル（任意）",
+        考察チャンネル="レポート内で「感想・考察はこちら」と案内するチャンネル（任意）",
+    )
+    async def env_report_setup(self, interaction: discord.Interaction,
+                               パネルのチャンネル: discord.TextChannel = None,
+                               考察チャンネル: discord.TextChannel = None):
+        await set_state(ENV_REPORT_CHANNEL_KEY, str(interaction.channel_id))
+        if パネルのチャンネル is not None:
+            await set_state(ENV_REPORT_PANEL_KEY, str(パネルのチャンネル.id))
+        if 考察チャンネル is not None:
+            await set_state(ENV_REPORT_DISCUSS_KEY, str(考察チャンネル.id))
+        await interaction.response.send_message(
+            f"✅ 環境レポートの投稿先を {interaction.channel.mention} に設定しました。\n"
+            f"{ENV_REPORT_INTERVAL_DAYS}日に1回、{ENV_REPORT_HOUR}:{ENV_REPORT_MINUTE:02d} に自動投稿します"
+            f"（現環境の記録が{ENV_REPORT_MIN_MATCHES}戦未満の週は投稿しません）。\n"
+            f"-# 今すぐ投稿するには `/戦績管理 環境レポート投稿` を使ってください。",
+            ephemeral=True,
+        )
+
+    @admin.command(name="環境レポート投稿", description="環境レポートを今すぐ投稿先のチャンネルへ投稿します")
+    async def env_report_post_now(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            posted, reason = await self._post_env_report(force=True)
+        except Exception as e:
+            posted, reason = False, f"エラーが発生しました：{type(e).__name__}: {e}"
+        await interaction.followup.send(("✅ " if posted else "❌ ") + reason, ephemeral=True)
+
+    @admin.command(name="環境レポート停止", description="環境レポートの自動投稿を止めます")
+    async def env_report_stop(self, interaction: discord.Interaction):
+        await set_state(ENV_REPORT_CHANNEL_KEY, "")
+        await interaction.response.send_message(
+            "⏸ 環境レポートの自動投稿を止めました。再開するには `/戦績管理 環境レポート設置` を実行してください。",
+            ephemeral=True,
+        )
+
+    # ---- 個人のAI分析（パネルの「🤖 AIで分析」） ----
+    async def _show_personal_ai(self, interaction: discord.Interaction):
+        user_id = str(interaction.user.id)
+        settings = await get_user_settings(user_id)
+        if settings is None or not settings.get("my_deck"):
+            await interaction.response.send_message(
+                "まず「🆕 初回設定」か「⚙️ 設定を変える」でデッキを登録してください。", ephemeral=True
+            )
+            return
+
+        today = datetime.now(JST).date().isoformat()
+        state_key = AI_PERSONAL_STATE_PREFIX + user_id
+        if await get_state(state_key) == today:
+            await interaction.response.send_message(
+                "🤖 AI分析は1日1回までです。また明日お試しください。", ephemeral=True
+            )
+            return
+
+        mine, everyone = await get_personal_ai_data(
+            user_id, settings["format"], settings["my_class"], settings["my_deck"]
+        )
+        if len(mine) < AI_PERSONAL_MIN_MATCHES:
+            await interaction.response.send_message(
+                f"🤖 **{settings['my_deck']}**の記録が{len(mine)}戦です。"
+                f"AI分析は{AI_PERSONAL_MIN_MATCHES}戦から使えます（今回は回数に数えません）。",
+                ephemeral=True,
+            )
+            return
+
+        api_key = os.environ.get(ENV_REPORT_AI_KEY_ENV)
+        if AsyncAnthropic is None or not api_key:
+            await interaction.response.send_message("🤖 AI分析は現在準備中です。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        data_text = build_personal_ai_dataset(settings, mine, everyone)
+        system = (
+            "あなたはシャドウバース ワールズビヨンドのDiscordコミュニティで、"
+            "メンバー本人の対戦記録を読み解く担当です。本人に向けて書く。\n"
+            "【データの読み方】\n"
+            "- 「ほかの人」は同じデッキを使った本人以外のメンバーの記録。本人の得意・苦手は、ほかの人との差で判断する。"
+            "ほかの人の試合数が少ない項目は、比較の信頼度が低いと添える。\n"
+            "- 対面ごとの数字は試合数が少ない。15戦未満のものに触れるときは「まだ試合数が少ない」と必ず添える。\n"
+            "【厳守するルール】\n"
+            "1. 渡された数字だけを根拠にする。カード名・カードの効果・デッキの中身・プレイングの具体的な指示には一切触れない"
+            "（データに含まれていないため。推測で書くと誤情報になる）。デッキ名は渡されたものをそのまま使う。\n"
+            "2. 本人を責める・煽る書き方はしない。「下手」「弱い」などの言葉は使わない。\n"
+            "3. 日本語・です・ます調で、箇条書き4〜5個、全体で400字以内。見出しや前置き、締めの挨拶は書かない。\n"
+            "4. 最後の箇条書きは「次に意識して記録・確認するとよいこと」を1つ書く"
+            "（例：この対面の試合数を増やして確かめる、先攻後攻の差を見る など。プレイングの指示はしない）。"
+        )
+        try:
+            client = AsyncAnthropic(api_key=api_key, timeout=60)
+            msg = await client.messages.create(
+                model=AI_PERSONAL_MODEL,
+                max_tokens=700,
+                system=system,
+                messages=[{"role": "user", "content": f"次の記録を読み解いてください。\n\n{data_text}"}],
+            )
+            text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
+        except Exception as e:
+            print(f"⚠️ 個人のAI分析に失敗しました: {type(e).__name__}: {e}")
+            text = ""
+        if not text:
+            await interaction.followup.send(
+                "🤖 AI分析に失敗しました。時間をおいてもう一度お試しください（今回は回数に数えません）。",
+                ephemeral=True,
+            )
+            return
+
+        await set_state(state_key, today)
+        await log_command_usage(user_id, "AI個人分析")
+        await interaction.followup.send(
+            f"🤖 **{settings['my_deck']}のAI分析**（あなたの記録{len(mine)}戦・同じデッキのほかの人{len(everyone)}戦と比較）\n"
+            f"{text[:1400]}\n"
+            f"{ENV_REPORT_AI_DISCLAIMER}",
             ephemeral=True,
         )
 
     # ---- /弱点対面 ----
     # SENSEKI_MEMBERS_ONLY が true になるまで①②とも誰でも使える（コマンド自体の公開範囲）。
     # ②（全体平均との比較）は premium_access() で個別に判定：
-    #   会員 / 今の環境が無料開放中(PREMIUM_FREE_THIS_ENV) / 初回登録から TRIAL_DAYS 日以内
-    #   のいずれかを満たせば表示。次の環境ではPREMIUM_FREE_THIS_ENVをFalseに戻すこと。
+    #   会員 / 今の環境が無料開放中(PREMIUM_FREE_ENV_IDS) / 初回登録から TRIAL_DAYS 日以内
+    #   のいずれかを満たせば表示。無料開放する環境は PREMIUM_FREE_ENV_IDS で管理。
     async def _show_weak_matchups(self, interaction: discord.Interaction):
         """/戦績 弱点対面 とパネルのボタンの両方から呼ぶ"""
         if SENSEKI_MEMBERS_ONLY and not is_member(interaction.user):
@@ -4317,7 +5411,6 @@ class SensekiCog(commands.Cog):
             else:
                 lines.append(f"通算{full['total']}戦（勝率は🔒メンバーシップ限定）")
 
-        lines.append("\n対面別の弱点はパネルの「📉 弱点対面」から確認できます。")
 
         overall = await get_summary(str(interaction.user.id))
         if overall["total"] > full["total"]:
