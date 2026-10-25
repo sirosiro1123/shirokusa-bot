@@ -1642,6 +1642,37 @@ def build_personal_ai_dataset(settings: dict, mine: list, everyone: list) -> str
     return "\n".join(lines)
 
 
+# AIの呼び出しに使うモデルが返答できなかったときの予備（Haiku）
+AI_FALLBACK_MODEL = "claude-haiku-5-5"
+# 返答の上限。モデルによっては内部で考える分にも使うため、短くしすぎると本文が空になる
+AI_MAX_TOKENS = 3000
+
+
+async def ask_ai(api_key: str, model: str, system: str, user_text: str):
+    """
+    AIに1回質問する。指定モデルで本文が返らなければ予備モデルでもう一度試す。
+    戻り値：(本文 or None, 使ったモデル, 失敗の理由 or None)
+    """
+    client = AsyncAnthropic(api_key=api_key, timeout=90)
+    reasons = []
+    for m in dict.fromkeys([model, AI_FALLBACK_MODEL]):  # 同じモデルなら1回だけ
+        try:
+            msg = await client.messages.create(
+                model=m, max_tokens=AI_MAX_TOKENS, system=system,
+                messages=[{"role": "user", "content": user_text}],
+            )
+            text = "".join(
+                b.text for b in msg.content if getattr(b, "type", "") == "text"
+            ).strip()
+            if text:
+                return text, m, None
+            kinds = ",".join(getattr(b, "type", "?") for b in msg.content) or "なし"
+            reasons.append(f"{m}: 本文なし（stop_reason={getattr(msg, 'stop_reason', '?')} / 中身={kinds}）")
+        except Exception as e:
+            reasons.append(f"{m}: {type(e).__name__}: {e}"[:250])
+    return None, model, " ／ ".join(reasons)
+
+
 def _get_command_usage_stats_sync():
     conn = _connect()
     try:
@@ -4849,6 +4880,7 @@ class SensekiCog(commands.Cog):
         matches = await fetch_all_matches(env_only=True)
         data_text = build_ai_dataset(matches, current_env_id(), datetime.now(JST))
         if data_text is None:
+            self._last_ai_error = "ローテーションの記録がないため、AIに渡す集計を作れませんでした"
             return None
         if report_data:
             pairs = []
@@ -4883,24 +4915,18 @@ class SensekiCog(commands.Cog):
             "5. 日本語・だ・である調で、箇条書き4〜5個、全体で400字以内。見出しや前置き、締めの挨拶は書かない。\n"
             "6. 最後の箇条書きは「次の記録で確かめたいこと」を1つ書く。"
         )
-        try:
-            client = AsyncAnthropic(api_key=api_key, timeout=60)
-            msg = await client.messages.create(
-                model=ENV_REPORT_AI_MODEL,
-                max_tokens=700,
-                system=system,
-                messages=[{"role": "user", "content": f"次の集計を読み解いてください。\n\n{data_text}"}],
-            )
-            text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
-            if not text:
-                return None
-            print(f"✅ 環境レポートのAI分析に成功しました（モデル：{ENV_REPORT_AI_MODEL}）")
-            # Discordの2000字制限に余裕を残す
-            return text[:900]
-        except Exception as e:
-            self._last_ai_error = f"{type(e).__name__}: {e}"[:300]
-            print(f"⚠️ 環境レポートのAI分析に失敗しました: {type(e).__name__}: {e}")
+        text, used_model, error = await ask_ai(
+            api_key, ENV_REPORT_AI_MODEL, system, f"次の集計を読み解いてください。\n\n{data_text}"
+        )
+        if not text:
+            self._last_ai_error = error
+            print(f"⚠️ 環境レポートのAI分析に失敗しました: {error}")
             return None
+        if error is None and used_model != ENV_REPORT_AI_MODEL:
+            print(f"ℹ️ {ENV_REPORT_AI_MODEL} で返答がなかったため {used_model} で分析しました")
+        print(f"✅ 環境レポートのAI分析に成功しました（モデル：{used_model}）")
+        # Discordの2000字制限に余裕を残す
+        return text[:900]
 
     @tasks.loop(time=dtime(hour=ENV_REPORT_HOUR, minute=ENV_REPORT_MINUTE, tzinfo=JST))
     async def env_report_loop(self):
@@ -5012,18 +5038,11 @@ class SensekiCog(commands.Cog):
             "4. 最後の箇条書きは「次に意識して記録・確認するとよいこと」を1つ書く"
             "（例：この対面の試合数を増やして確かめる、先攻後攻の差を見る など。プレイングの指示はしない）。"
         )
-        try:
-            client = AsyncAnthropic(api_key=api_key, timeout=60)
-            msg = await client.messages.create(
-                model=AI_PERSONAL_MODEL,
-                max_tokens=700,
-                system=system,
-                messages=[{"role": "user", "content": f"次の記録を読み解いてください。\n\n{data_text}"}],
-            )
-            text = "".join(b.text for b in msg.content if getattr(b, "type", "") == "text").strip()
-        except Exception as e:
-            print(f"⚠️ 個人のAI分析に失敗しました: {type(e).__name__}: {e}")
-            text = ""
+        text, _used, error = await ask_ai(
+            api_key, AI_PERSONAL_MODEL, system, f"次の記録を読み解いてください。\n\n{data_text}"
+        )
+        if error:
+            print(f"⚠️ 個人のAI分析に失敗しました: {error}")
         if not text:
             await interaction.followup.send(
                 "🤖 AI分析に失敗しました。時間をおいてもう一度お試しください（今回は回数に数えません）。",
