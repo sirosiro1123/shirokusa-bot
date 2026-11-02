@@ -506,6 +506,9 @@ def _parse_bool(raw: str) -> bool:
     return (raw or "").strip().lower() in ("1", "true", "yes", "on")
 
 SENSEKI_MEMBERS_ONLY = _parse_bool(os.environ.get("SENSEKI_MEMBERS_ONLY", ""))
+# 環境レポートに「デッキ相性表」の画像を載せるか。記録が増えるまでは載せない（既定）。
+# 戻すときはRailwayの変数に SENSEKI_REPORT_DECK_MATRIX=1 を入れる
+REPORT_SHOW_DECK_MATRIX = _parse_bool(os.environ.get("SENSEKI_REPORT_DECK_MATRIX", ""))
 
 # 記録・取消のあと、何秒待ってからシートへ反映するか
 # 0にすると毎試合すぐ書きに行くが、連戦時にGoogle側のAPI制限に触れる。
@@ -2092,6 +2095,115 @@ class SecondButton(discord.ui.Button):
         await view.refresh(interaction)
 
 
+# ---- 記録画面からのランク変更（ワンタップ） ----
+# ランクを「1段ずつの階段」として並べる。ランクアップ／ダウンはこの上を1つ動くだけ。
+# グランドマスターは、グレードなし→EPIC→ULTIMATE→LEGEND→BEYOND の順。
+# ※BEYONDは「LEGEND相当（CR1850以上）かつCRランキング100位以内」なので、
+#   LEGENDからの昇段として扱う（実際に条件を満たすかは本人が判断する）。
+RANK_LADDER = (
+    [(t, None) for t in RANK_TIER_CHOICES if t != GRAND_MASTER_TIER]
+    + [(GRAND_MASTER_TIER, None)]
+    + [(GRAND_MASTER_TIER, g) for g in CR_GRADE_CHOICES]
+)
+
+
+def rank_step_label(tier: str, grade) -> str:
+    """ランクの表示名。ボタンと完了メッセージで使う"""
+    if tier == GRAND_MASTER_TIER:
+        return f"GM・{grade}" if grade else "GM・グレードなし"
+    return tier
+
+
+def rank_step_index(tier, grade):
+    """今のランクが階段の何段目か。未設定や不明なら None"""
+    try:
+        return RANK_LADDER.index((tier, grade or None))
+    except ValueError:
+        return None
+
+
+class FlowRankStepButton(discord.ui.Button):
+    """ワンタップでランクを1段上げる／下げる。ボタンに移動先を表示するので押し間違えにくい"""
+
+    def __init__(self, direction: int, target):
+        tier, grade = target
+        arrow = "⬆" if direction > 0 else "⬇"
+        super().__init__(
+            label=f"{arrow} {rank_step_label(tier, grade)}",
+            style=discord.ButtonStyle.secondary, row=4,
+        )
+        self.direction = direction
+        self.target = target
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "SensekiFlowView" = self.view
+        tier, grade = self.target
+        ok = await update_rank(view.user_id, tier, grade)
+        if not ok:
+            await view.refresh(interaction, notice="⚠️ 先に初期設定をしてください。")
+            return
+        view.settings = await get_user_settings(view.user_id) or view.settings
+        cog = interaction.client.get_cog("SensekiCog")
+        if cog is not None:
+            await cog._update_board()
+        await view.refresh(interaction, notice=f"✅ ランクを **{rank_step_label(tier, grade)}** に更新しました。")
+
+
+class FlowRankPickButton(discord.ui.Button):
+    """階段で動かせない・大きく変えたいとき用。記録画面のままランクを選び直す"""
+
+    def __init__(self):
+        super().__init__(label="ランクを選ぶ", emoji="📈", style=discord.ButtonStyle.secondary, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "SensekiFlowView" = self.view
+        view.rank_mode = "tier"
+        await view.refresh(interaction)
+
+
+class FlowRankTierSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="ランク帯を選択",
+            options=[discord.SelectOption(label=r, value=r) for r in RANK_TIER_CHOICES],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "SensekiFlowView" = self.view
+        tier = self.values[0]
+        if tier == GRAND_MASTER_TIER:
+            view.rank_mode = "grade"
+            await view.refresh(interaction)
+            return
+        await view.apply_rank(interaction, tier, None)
+
+
+class FlowRankGradeSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="グレードを選択",
+            options=[discord.SelectOption(label=CR_GRADE_NONE_LABEL, value=CR_GRADE_NONE_VALUE)]
+                    + [discord.SelectOption(label=g, value=g) for g in CR_GRADE_CHOICES],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "SensekiFlowView" = self.view
+        grade = None if self.values[0] == CR_GRADE_NONE_VALUE else self.values[0]
+        await view.apply_rank(interaction, GRAND_MASTER_TIER, grade)
+
+
+class FlowRankBackButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="記録画面に戻る", style=discord.ButtonStyle.secondary, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        view: "SensekiFlowView" = self.view
+        view.rank_mode = None
+        await view.refresh(interaction)
+
+
 class WinButton(discord.ui.Button):
     def __init__(self):
         super().__init__(label="勝ち", style=discord.ButtonStyle.success, row=3)
@@ -2162,6 +2274,7 @@ class SensekiFlowView(discord.ui.View):
         self.opp_deck = None
         self.is_first = None
         self.restored = False
+        self.rank_mode = None  # None＝通常の記録画面 / "tier"・"grade"＝ランク選択中
         self._deck_cache: dict[str, list[str]] = {}
 
     @classmethod
@@ -2213,6 +2326,10 @@ class SensekiFlowView(discord.ui.View):
         lines = []
         if notice:
             lines.append(notice)
+        if self.rank_mode == "tier":
+            return "\n".join(lines + ["新しいランク帯を選んでください。"])
+        if self.rank_mode == "grade":
+            return "\n".join(lines + [f"グレードを選んでください（付いていなければ「{CR_GRADE_NONE_LABEL}」）。"])
         if self.opp_class is not None and self.is_first is not None:
             lines.append("準備OKです。試合が終わったら **④ 勝ち／負け** を押してください。")
             lines.append("-# 相手のデッキが分かったら、勝敗を押す前に②で選べます（任意）。")
@@ -2234,6 +2351,14 @@ class SensekiFlowView(discord.ui.View):
     async def build(self):
         """選択状態に合わせて入力画面の部品を並べ直す"""
         self.clear_items()
+        if self.rank_mode == "tier":
+            self.add_item(FlowRankTierSelect())
+            self.add_item(FlowRankBackButton())
+            return
+        if self.rank_mode == "grade":
+            self.add_item(FlowRankGradeSelect())
+            self.add_item(FlowRankBackButton())
+            return
         self.add_item(OpponentClassSelect(self.opp_class))
         self.add_item(OpponentDeckSelect(
             await self._known_decks(), self.opp_deck, enabled=self.opp_class is not None,
@@ -2243,6 +2368,30 @@ class SensekiFlowView(discord.ui.View):
         self.add_item(WinButton())
         self.add_item(LoseButton())
         self.add_item(FlowSettingsButton())
+        # ランク変更（4段目）：ワンタップで1段上下＋選び直し
+        idx = rank_step_index(self.settings.get("rank_tier"), self.settings.get("cr_grade"))
+        if idx is not None:
+            if idx > 0:
+                self.add_item(FlowRankStepButton(-1, RANK_LADDER[idx - 1]))
+            if idx < len(RANK_LADDER) - 1:
+                self.add_item(FlowRankStepButton(+1, RANK_LADDER[idx + 1]))
+        self.add_item(FlowRankPickButton())
+
+    async def apply_rank(self, interaction: discord.Interaction, tier: str, grade):
+        """ランク選択の結果を保存して、記録画面に戻る"""
+        ok = await update_rank(self.user_id, tier, grade)
+        if not ok:
+            self.rank_mode = None
+            await self.refresh(interaction, notice="⚠️ 先に初期設定をしてください。")
+            return
+        self.settings = await get_user_settings(self.user_id) or self.settings
+        self.rank_mode = None
+        cog = interaction.client.get_cog("SensekiCog")
+        if cog is not None:
+            await cog._update_board()
+        await self.refresh(
+            interaction, notice=f"✅ ランクを **{rank_step_label(tier, grade)}** に更新しました。"
+        )
 
     async def refresh(self, interaction: discord.Interaction, notice: str = None):
         await self.build()
@@ -4759,9 +4908,11 @@ class SensekiCog(commands.Cog):
             jobs += [
                 asyncio.to_thread(render_deck_ranking, data, date_label),
                 asyncio.to_thread(render_env_map, data),
-                asyncio.to_thread(render_deck_matrix, data),
             ]
-            names += ["よく当たるデッキ.png", "環境マップ.png", "デッキ相性表.png"]
+            names += ["よく当たるデッキ.png", "環境マップ.png"]
+            if REPORT_SHOW_DECK_MATRIX:
+                jobs.append(asyncio.to_thread(render_deck_matrix, data))
+                names.append("デッキ相性表.png")
         jobs.append(asyncio.to_thread(
             self._render_matchup_heatmap_sync, matchup_rows, CLASS_CHOICES,
             MATCHUP_MATRIX_MIN_SAMPLE, current_env_id(),
@@ -4912,8 +5063,17 @@ class SensekiCog(commands.Cog):
             "2. 30戦未満の数字には触れない。\n"
             "3. 記録が一部の記録者に偏っている場合は、そのことを1回だけ短く添える。\n"
             "4. 「最強」「環境トップ」「必ず勝てる」などの断定や煽りは使わない。\n"
-            "5. 日本語・だ・である調で、箇条書き4〜5個、全体で400字以内。見出しや前置き、締めの挨拶は書かない。\n"
-            "6. 最後の箇条書きは「次の記録で確かめたいこと」を1つ書く。"
+            "5. 日本語・です・ます調で、箇条書き3〜4個、全体で300字以内。見出しや前置き、締めの挨拶は書かない。\n"
+            "6. 「次の記録で確かめたいこと」などの今後の予告・宣言は書かない。\n"
+            "【書き方（読みやすさ）】\n"
+            "- 各項目は「結論を先に、数字は後から1つだけ添える」。"
+            "例：「秘術ウィッチは約49%と、記録者全体の平均（約60%）より低く、苦戦しやすいようです」"
+            "「ランプ（ドラゴン）は70%と平均を大きく上回り、よく勝てています」。\n"
+            "- 「平均との差」のポイント数値（-11.6、+9.7など）や、括弧の中に数字を並べる書き方はしない。"
+            "勝率は「約49%」のように整数で、試合数は「39戦で」のように文中で1回だけ必要なときに添える。\n"
+            "- 勝率が平均より低い＝勝ちにくい・苦戦しやすい、高い＝勝ちやすい・よく勝てている、と言葉で結論を書く。"
+            "「負けやすい傾向」などの曖昧な言い方は避ける。\n"
+            "- 一つの項目に数字は多くても2つまで。難しい統計用語（「平均との差」「乖離」など）は使わない。"
         )
         text, used_model, error = await ask_ai(
             api_key, ENV_REPORT_AI_MODEL, system, f"次の集計を読み解いてください。\n\n{data_text}"
