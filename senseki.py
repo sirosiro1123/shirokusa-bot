@@ -1796,7 +1796,7 @@ def build_ai_dataset(matches: list[dict], env_id: str, now: datetime):
         by_cls.setdefault(r["opp_class"], []).append(r)
     for c, rs in sorted(by_cls.items(), key=lambda kv: -len(kv[1])):
         w = pct(wins(rs), len(rs))
-        lines.append(f"- {c}：{len(rs)}戦（{pct(len(rs), n):.1f}%）・勝率{w:.1f}%（平均との差 {w - avg:+.1f}）")
+        lines.append(f"- {c}：{len(rs)}戦（{pct(len(rs), n):.1f}%）・このクラスと当たったときの記録者の勝率{w:.1f}%（平均との差 {w - avg:+.1f}）")
     lines.append("")
 
     # 相手デッキ
@@ -1808,7 +1808,7 @@ def build_ai_dataset(matches: list[dict], env_id: str, now: datetime):
     for (c, d), rs in sorted(by_deck.items(), key=lambda kv: -len(kv[1]))[:ENV_REPORT_AI_TOP_DECKS]:
         w = pct(wins(rs), len(rs))
         lines.append(
-            f"- {d}（{c}）：{len(rs)}戦（{pct(len(rs), len(with_deck)):.1f}%）・勝率{w:.1f}%（平均との差 {w - avg:+.1f}）"
+            f"- {d}（{c}）：{len(rs)}戦（{pct(len(rs), len(with_deck)):.1f}%）・このデッキと当たったときの記録者の勝率{w:.1f}%（平均との差 {w - avg:+.1f}）"
         )
     lines.append("")
 
@@ -1817,7 +1817,7 @@ def build_ai_dataset(matches: list[dict], env_id: str, now: datetime):
     for flag, label in ((1, "先攻"), (0, "後攻")):
         rs = [r for r in rows if r["is_first"] == flag]
         if rs:
-            lines.append(f"- {label}：{len(rs)}戦・勝率{pct(wins(rs), len(rs)):.1f}%")
+            lines.append(f"- {label}：{len(rs)}戦・記録者の勝率{pct(wins(rs), len(rs)):.1f}%")
     lines.append("")
 
     # 直近と以前の比較（相手クラス・相手デッキの使用率の変化）
@@ -2130,7 +2130,7 @@ class FlowRankStepButton(discord.ui.Button):
         arrow = "⬆" if direction > 0 else "⬇"
         super().__init__(
             label=f"{arrow} {rank_step_label(tier, grade)}",
-            style=discord.ButtonStyle.secondary, row=4,
+            style=discord.ButtonStyle.primary, row=4,
         )
         self.direction = direction
         self.target = target
@@ -2147,6 +2147,17 @@ class FlowRankStepButton(discord.ui.Button):
         if cog is not None:
             await cog._update_board()
         await view.refresh(interaction, notice=f"✅ ランクを **{rank_step_label(tier, grade)}** に更新しました。")
+
+
+class FlowRankNowButton(discord.ui.Button):
+    """4段目の左端に「今のランク」を表示するだけのボタン（押せない）。ランク欄だと気づきやすくする"""
+
+    def __init__(self, tier, grade):
+        text = rank_step_label(tier, grade) if tier else "未設定"
+        super().__init__(
+            label=f"今のランク：{text}", emoji="📈",
+            style=discord.ButtonStyle.secondary, disabled=True, row=4,
+        )
 
 
 class FlowRankPickButton(discord.ui.Button):
@@ -2256,7 +2267,7 @@ class FlowSettingsButton(discord.ui.Button):
     """記録画面から設定メニューを開く。記録時に設定を読み直すので、変えたらそのまま記録できる"""
 
     def __init__(self):
-        super().__init__(label="設定を変える", emoji="⚙️", style=discord.ButtonStyle.secondary, row=4)
+        super().__init__(label="設定を変える", emoji="⚙️", style=discord.ButtonStyle.secondary, row=2)
 
     async def callback(self, interaction: discord.Interaction):
         await send_settings_menu(interaction)
@@ -2299,7 +2310,10 @@ class SensekiFlowView(discord.ui.View):
             rank += f"・{s['cr_grade']}"
         elif s.get("rank_tier") == GRAND_MASTER_TIER:
             rank += "・グレードなし"
-        return f"🧑 あなた：**{deck}**（{s['my_class']} / {fmt}） / ランク：**{rank}**"
+        return (
+            f"🧑 あなた：**{deck}**（{s['my_class']} / {fmt}）\n"
+            f"📈 現在のランク：**{rank}**　-# 変わったら下の青いボタンで更新"
+        )
 
     def describe_progress(self) -> str:
         """ここまでに選んだ内容を1行で"""
@@ -2368,7 +2382,8 @@ class SensekiFlowView(discord.ui.View):
         self.add_item(WinButton())
         self.add_item(LoseButton())
         self.add_item(FlowSettingsButton())
-        # ランク変更（4段目）：ワンタップで1段上下＋選び直し
+        # ランク変更（4段目）：今のランク表示＋ワンタップで1段上下＋選び直し
+        self.add_item(FlowRankNowButton(self.settings.get("rank_tier"), self.settings.get("cr_grade")))
         idx = rank_step_index(self.settings.get("rank_tier"), self.settings.get("cr_grade"))
         if idx is not None:
             if idx > 0:
@@ -2438,7 +2453,8 @@ class SensekiFlowView(discord.ui.View):
         await interaction.response.edit_message(
             content=self.screen(
                 f"✅ **{result_label}** で記録しました。{tag_note}\n"
-                f"続けて記録する場合は「同じ設定でもう1試合」、押し間違えた場合は「今の記録を取り消す」を押してください。"
+                f"続けて記録する場合は「同じ設定でもう1試合」、押し間違えた場合は「今の記録を取り消す」を押してください。\n"
+                f"-# 📈 ランクやグレードが変わったときは、次の記録画面の一番下の青いボタンで更新できます。"
             ),
             view=self,
         )
@@ -5053,6 +5069,10 @@ class SensekiCog(commands.Cog):
             "【データの読み方】\n"
             "- 環境の使用率は「相手側」の数字で判断する（相手はマッチングでランダムに当たるため）。"
             "記録者自身のデッキの数は、記録者の好みに偏るので使用率として扱わない。\n"
+            "- データの「勝率」はすべて記録者自身の勝率。相手クラス・相手デッキの行の勝率は"
+            "「そのクラス／デッキと当たったとき、記録者が勝った割合」であり、そのデッキ自体の勝率ではない。"
+            "勝率が高い＝記録者にとって勝ちやすい相手（そのデッキは弱め）、低い＝手ごわい相手（そのデッキは強め）。"
+            "この向きを取り違えない。\n"
             "- 記録者は上位ランク帯が多く、全体の勝率が50%より高い。"
             "勝ちやすさ・勝ちにくさは、必ず「記録者全体の平均勝率との差」で判断する。\n"
             "- 「直近」と「それより前」の比較があれば、使用率が増えた・減ったものを優先して書く。"
@@ -5067,11 +5087,14 @@ class SensekiCog(commands.Cog):
             "6. 「次の記録で確かめたいこと」などの今後の予告・宣言は書かない。\n"
             "【書き方（読みやすさ）】\n"
             "- 各項目は「結論を先に、数字は後から1つだけ添える」。"
-            "例：「秘術ウィッチは約49%と、記録者全体の平均（約60%）より低く、苦戦しやすいようです」"
-            "「ランプ（ドラゴン）は70%と平均を大きく上回り、よく勝てています」。\n"
+            "例：「秘術ウィッチと当たったときの勝率は約49%で、記録者全体の平均（約60%）より低く、手ごわい相手です」"
+            "「ランプ（ドラゴン）との対戦は約70%勝てていて、平均を大きく上回る、勝ちやすい相手です」。\n"
+            "- 勝率を書くときは必ず「〇〇と当たったとき」「〇〇との対戦では」と、誰から見た数字かを主語に入れる。"
+            "「ランプは勝率70%」のような、デッキ自体の勝率に読める書き方は禁止。\n"
             "- 「平均との差」のポイント数値（-11.6、+9.7など）や、括弧の中に数字を並べる書き方はしない。"
             "勝率は「約49%」のように整数で、試合数は「39戦で」のように文中で1回だけ必要なときに添える。\n"
-            "- 勝率が平均より低い＝勝ちにくい・苦戦しやすい、高い＝勝ちやすい・よく勝てている、と言葉で結論を書く。"
+            "- 相手デッキ・相手クラスについては、勝率が平均より低ければ「手ごわい相手」「勝ちにくい相手」、"
+            "高ければ「勝ちやすい相手」と言葉で結論を書く。先攻・後攻は記録者自身の勝率なので「先攻だと約65%勝てている」と書く。"
             "「負けやすい傾向」などの曖昧な言い方は避ける。\n"
             "- 一つの項目に数字は多くても2つまで。難しい統計用語（「平均との差」「乖離」など）は使わない。"
         )
