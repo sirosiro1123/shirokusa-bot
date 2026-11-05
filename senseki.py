@@ -40,6 +40,8 @@ senseki.py
     デッキ名統合  表記ゆれのあるデッキ名を1つに統合（過去の記録も一括書き換え）
     無料トライアル開始／無料トライアル状況  初回参加者向け無料キャンペーンの開始とON後の状況確認
     記事登録／記事一覧／記事削除  対面ごとのおすすめ記事URLの管理
+    質問ヒント設置／投稿／停止  毎週金曜20時に「質問のヒント」を自動投稿（AIなし）。ボタンで個人用ヒントとクラス別質問
+    質問先設定    クラスごとの質問の投稿先チャンネルを設定
 
 【データの保存先について】
   Railwayの永続ボリュームのマウント先はプロジェクトによって異なる
@@ -3338,6 +3340,9 @@ class SensekiPanelView(discord.ui.View):
         # 2段目：設定
         self.add_item(PanelSetupButton())
         self.add_item(PanelSettingsButton())
+        # 質問・相談（ヒント、クラス別チャンネル・シャドバ相談所への質問）
+        self.add_item(PanelHintButton())
+        self.add_item(PanelAskButton())
 
 
 class LegacyPanelView(discord.ui.View):
@@ -3708,6 +3713,425 @@ def render_deck_matrix(data: dict):
 # Cog本体
 # ==============================
 
+# ==============================
+# 質問のヒント（毎週金曜に自動投稿＋ボタン）／クラス別チャンネルへの質問
+# ==============================
+# AIは使わない。決まった基準で「聞いてみるとよさそうな相手」を出し、助言として表示するだけ。
+HINT_POST_HOUR = 20                 # 自動投稿の時刻（JST）
+HINT_POST_WEEKDAY = 4               # 曜日（月=0 … 金=4）
+HINT_CHANNEL_KEY = "hint_post_channel_id"
+HINT_LAST_DATE_KEY = "hint_post_last_date"
+QUESTION_CHANNEL_KEY_PREFIX = "question_channel_"   # + クラス名
+HINT_ENV_MIN_GAMES = 10             # 環境全体のヒントに使う最低試合数（30戦未満は「参考」表示）
+HINT_ENV_MIN_USERS = 3              # 環境全体のヒントに使う最低記録者数（個人の特定を防ぐ）
+HINT_ENV_GAP = -2.0                 # 平均よりこれ以上低いものを「手ごわい」候補にする
+HINT_PERSONAL_MIN_TOTAL = 20        # 個人用ヒントを出す最低試合数
+HINT_PERSONAL_MIN_GAMES = 5         # 個人用：相手ごとの最低試合数
+HINT_PERSONAL_GAP = 15.0            # 個人用：自分の平均よりこれ以上低い相手を苦手候補にする
+HINT_FIRST_MIN_GAMES = 10           # 先攻・後攻の差を見る最低試合数（それぞれ）
+HINT_FIRST_GAP = 15.0
+# 環境レポートの直後に、質問のヒントも一緒に投稿する（既定ON）。
+# OFFにしたいときはRailwayの変数 SENSEKI_HINT_WITH_REPORT=0 。OFFのときは毎週金曜の単独投稿に切り替わる
+HINT_WITH_REPORT = _parse_bool(os.environ.get("SENSEKI_HINT_WITH_REPORT", "1"))
+QUESTION_COOLDOWN_SECONDS = 600     # 質問の連続投稿の間隔
+QUESTION_DAILY_LIMIT = 3            # 1人が1日に投稿できる質問数
+_QUESTION_LOG: dict[str, list] = {}
+CONSULT_KEY = "相談所"   # 「シャドバ相談所」を表すキー（クラス名と区別するため）
+# クラス別チャンネルの初期値（/戦績管理 質問先設定 で上書きできる）
+CLASS_CHANNEL_DEFAULTS = {
+    "エルフ": "1384171023766781982",
+    "ロイヤル": "1384171025151037631",
+    "ウィッチ": "1384171181090930811",
+    "ドラゴン": "1384171197004255325",
+    "ナイトメア": "1384171212716113930",
+    "ビショップ": "1384171225345036338",
+    "ネメシス": "1384171237919428659",
+    # デッキ選びの相談（使うデッキが決まっていない人向け）
+    CONSULT_KEY: "1401026533434458264",
+}
+
+
+async def class_channel_id(cls: str):
+    """クラス別チャンネルのID。管理者の設定があればそれを、なければ初期値を使う"""
+    return (await get_state(QUESTION_CHANNEL_KEY_PREFIX + cls)) or CLASS_CHANNEL_DEFAULTS.get(cls)
+
+
+async def class_channel_map() -> dict:
+    out = {c: await class_channel_id(c) for c in CLASS_CHOICES}
+    out[CONSULT_KEY] = await class_channel_id(CONSULT_KEY)
+    return out
+
+
+def _consult_note(channels: dict) -> str:
+    ch = _chan(channels, CONSULT_KEY)
+    return f"🧭 使うデッキが決まっていない・迷っている方は、シャドバ相談所 {ch} へ" if ch else ""
+
+
+def _chan(channels: dict, cls: str) -> str:
+    cid = (channels or {}).get(cls)
+    return f"<#{cid}>" if cid else ""
+
+
+def _rotation_rows(matches: list[dict]) -> list[dict]:
+    return [m for m in matches if m.get("format") == "rotation"]
+
+
+def _env_share_map(rows: list[dict]) -> dict:
+    """相手デッキごとの「当たる割合(%)」。相手デッキの入力があった試合だけで計算"""
+    with_deck = [r for r in rows if r.get("opp_deck")]
+    total = len(with_deck) or 1
+    counts: dict = {}
+    for r in with_deck:
+        k = (r["opp_class"], r["opp_deck"])
+        counts[k] = counts.get(k, 0) + 1
+    return {k: v / total * 100 for k, v in counts.items()}
+
+
+def compute_env_hints(matches: list[dict], limit: int = 3):
+    """環境全体のヒント：よく当たるのに記録者が勝ちにくい相手。戻り値：(候補のリスト, 記録者全体の平均勝率)"""
+    rows = _rotation_rows(matches)
+    if not rows:
+        return [], 0.0
+    avg = sum(1 for r in rows if r["is_win"]) / len(rows) * 100
+    shares = _env_share_map(rows)
+    groups: dict = {}
+    for r in rows:
+        if r.get("opp_deck"):
+            groups.setdefault((r["opp_class"], r["opp_deck"]), []).append(r)
+    out = []
+    for (c, d), rs in groups.items():
+        n = len(rs)
+        users = len({r["user_id"] for r in rs})
+        if n < HINT_ENV_MIN_GAMES or users < HINT_ENV_MIN_USERS:
+            continue
+        rate = sum(1 for r in rs if r["is_win"]) / n * 100
+        gap = rate - avg
+        if gap > HINT_ENV_GAP:
+            continue
+        share = shares.get((c, d), 0.0)
+        out.append({"class": c, "deck": d, "games": n, "share": share, "rate": rate, "gap": gap,
+                    "score": share * (-gap)})
+    out.sort(key=lambda x: -x["score"])
+    return out[:limit], avg
+
+
+def compute_personal_hints(matches: list[dict], user_id: str) -> dict:
+    """個人用のヒント。自分の記録と、環境全体の「当たる割合」だけを使う（他人の記録は出さない）"""
+    all_rows = _rotation_rows(matches)
+    mine = [r for r in all_rows if r["user_id"] == user_id]
+    res = {"total": len(mine), "enough": len(mine) >= HINT_PERSONAL_MIN_TOTAL,
+           "avg": None, "weak": [], "first": None}
+    if not mine or not res["enough"]:
+        return res
+    avg = sum(1 for r in mine if r["is_win"]) / len(mine) * 100
+    res["avg"] = avg
+    shares = _env_share_map(all_rows)
+    groups: dict = {}
+    for r in mine:
+        if r.get("opp_deck"):
+            groups.setdefault((r["opp_class"], r["opp_deck"]), []).append(r)
+    weak = []
+    for (c, d), rs in groups.items():
+        n = len(rs)
+        if n < HINT_PERSONAL_MIN_GAMES:
+            continue
+        rate = sum(1 for r in rs if r["is_win"]) / n * 100
+        if rate <= avg - HINT_PERSONAL_GAP:
+            weak.append({"class": c, "deck": d, "games": n, "rate": rate, "share": shares.get((c, d), 0.0)})
+    weak.sort(key=lambda x: (-x["share"], x["rate"]))
+    res["weak"] = weak[:3]
+    first = [r for r in mine if r["is_first"] == 1]
+    second = [r for r in mine if r["is_first"] == 0]
+    if len(first) >= HINT_FIRST_MIN_GAMES and len(second) >= HINT_FIRST_MIN_GAMES:
+        fr = sum(1 for r in first if r["is_win"]) / len(first) * 100
+        sr = sum(1 for r in second if r["is_win"]) / len(second) * 100
+        if abs(fr - sr) >= HINT_FIRST_GAP:
+            res["first"] = {"first_rate": fr, "first_n": len(first), "second_rate": sr, "second_n": len(second)}
+    return res
+
+
+def _hint_label(gap: float, games: int) -> str:
+    label = "手ごわい相手" if gap <= -6 else "やや手ごわい相手"
+    return label + ("（参考）" if games < MIN_SAMPLE_FOR_STATS else "")
+
+
+def build_env_hint_post(hints: list, avg: float, channels: dict = None) -> str:
+    lines = [
+        "🎯 **今週の質問のヒント**",
+        "",
+        f"最近の記録から、「聞いてみるとよさそうな相手」です（記録者全体の平均勝率は約{avg:.0f}%）。",
+    ]
+    for i, h in enumerate(hints, 1):
+        lines.append(
+            f"{i}. **{h['deck']}**（{h['class']}）：当たる割合 {h['share']:.0f}%／"
+            f"記録者の勝率 {h['rate']:.0f}%（{h['games']}戦）… {_hint_label(h['gap'], h['games'])}"
+        )
+        ch = _chan(channels, h["class"])
+        if ch:
+            lines.append(f"　→ 質問は {ch} へ")
+    lines += [
+        "",
+        "質問するときは、**自分のデッキ・ランク帯・どの場面で困ったか**を書くと、答えが付きやすくなります。",
+        _consult_note(channels),
+        "-# 勝率は「記録者がそのデッキと当たったときの勝率」です。数字は参考で、記録が少ないものは偏りがあります。",
+        "",
+        "▼ 自分の記録からのヒント／クラスを選んで質問",
+    ]
+    return "\n".join(lines)
+
+
+def build_personal_hint_text(res: dict, channels: dict = None, my_class: str = None) -> str:
+    all_ch = "　".join(f"{c} {_chan(channels, c)}" for c in CLASS_CHOICES if _chan(channels, c))
+    ch_note = f"\n\n📍 質問できるクラス別チャンネル\n{all_ch}" if all_ch else ""
+    consult = _consult_note(channels)
+    if consult:
+        ch_note += f"\n{consult}"
+    if res["total"] == 0:
+        return ("🎯 現環境の記録がまだありません。\n"
+                "#戦歴入力 から記録がたまると、あなた用のヒントが出せるようになります。" + ch_note)
+    if not res["enough"]:
+        need = HINT_PERSONAL_MIN_TOTAL - res["total"]
+        return (f"🎯 現環境の記録は{res['total']}戦です。\n"
+                f"あと**{need}戦**記録すると、あなた用のヒントが出せるようになります。\n"
+                "-# それまでは、投稿されている「今週の質問のヒント」を参考にしてください。" + ch_note)
+    lines = ["🎯 **あなた用の質問のヒント**（現環境・ローテーション）", ""]
+    if res["weak"]:
+        lines.append("【聞いてみるとよさそうな相手】")
+        for i, w in enumerate(res["weak"], 1):
+            lines.append(
+                f"{i}. **{w['deck']}**（{w['class']}）：あなたの勝率 {w['rate']:.0f}%（{w['games']}戦）"
+                f"／環境で当たる割合 {w['share']:.0f}%"
+            )
+            ch = _chan(channels, w["class"])
+            if ch:
+                lines.append(f"　→ {w['class']}のチャンネル {ch} で聞いてみるのがおすすめです")
+        lines.append("　例：「このデッキと当たったときの、立ち回りで意識することは？」")
+    else:
+        lines.append("【聞いてみるとよさそうな相手】\n特に苦手がはっきりしている相手は、今のところありません。")
+    if res["first"]:
+        f = res["first"]
+        lines += ["", "【先攻・後攻の差】",
+                  f"先攻 {f['first_rate']:.0f}%（{f['first_n']}戦）／後攻 {f['second_rate']:.0f}%（{f['second_n']}戦）"]
+        low = "後攻" if f["second_rate"] < f["first_rate"] else "先攻"
+        lines.append(f"　→ {low}のときの立ち回りを聞いてみてもよさそうです")
+        mine_ch = _chan(channels, my_class) if my_class else ""
+        if mine_ch:
+            lines.append(f"　　自分のクラスのチャンネル {mine_ch} がおすすめです")
+    consult = _consult_note(channels)
+    if consult:
+        lines += ["", consult]
+    lines += ["", "-# あくまで目安です。試合数が少ないうちは偏りが出ます。質問の書き方は「今週の質問のヒント」を参考にしてください。"]
+    return "\n".join(lines)
+
+
+async def submit_question(client, user, cls: str, title: str, body: str, attach: bool):
+    """
+    クラス別のチャンネル（またはシャドバ相談所）に、質問を投稿してスレッドを作る。
+    DiscordのボタンからもWebページからも共通で使う。戻り値：(成功したか, メッセージ, 投稿のURL)
+    user は discord.User / discord.Member。
+    """
+    import time as _time
+    user_id = str(user.id)
+    now = _time.time()
+    log = [t for t in _QUESTION_LOG.get(user_id, []) if now - t < 86400]
+    if log and now - log[-1] < QUESTION_COOLDOWN_SECONDS:
+        wait = int(QUESTION_COOLDOWN_SECONDS - (now - log[-1]))
+        return False, f"連続の投稿は少し間を空けてください（あと約{wait}秒）。", None
+    if len(log) >= QUESTION_DAILY_LIMIT:
+        return False, f"質問は1日{QUESTION_DAILY_LIMIT}件までです。また明日お願いします。", None
+    title = (title or "").strip()
+    body = (body or "").strip()
+    low = (title + " " + body).lower()
+    if "discord.gg/" in low or "discord.com/invite" in low:
+        return False, "招待リンクは投稿できません。", None
+    if not title or not body:
+        return False, "題名と内容を入力してください。", None
+
+    channel_id = await class_channel_id(cls)
+    if not channel_id:
+        return False, f"「{cls}」の質問先がまだ設定されていません。運営にお知らせください。", None
+    channel = client.get_channel(int(channel_id))
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(int(channel_id))
+        except discord.HTTPException:
+            return False, "質問先のチャンネルが見つかりません。運営にお知らせください。", None
+    if isinstance(user, discord.Member):
+        perms = channel.permissions_for(user)
+        if not (perms.view_channel and perms.send_messages):
+            return False, f"{channel.mention} に投稿できる権限がありません。", None
+
+    extra = ""
+    if attach:
+        settings = await get_user_settings(user_id)
+        matches = await fetch_all_matches(env_only=True)
+        mine = [r for r in _rotation_rows(matches) if r["user_id"] == user_id]
+        parts = []
+        if settings:
+            deck = settings.get("my_deck") or "デッキ未設定"
+            rank = settings.get("rank_tier") or "ランク未設定"
+            if settings.get("cr_grade"):
+                rank += f"・{settings['cr_grade']}"
+            parts.append(f"使用：{deck}（{settings.get('my_class', '')}）／{rank}")
+        if mine:
+            w = sum(1 for r in mine if r["is_win"])
+            parts.append(f"現環境の戦績：{len(mine)}戦 勝率{w / len(mine) * 100:.0f}%")
+            vs = [r for r in mine if r["opp_class"] == cls] if cls != CONSULT_KEY else []
+            if vs:
+                vw = sum(1 for r in vs if r["is_win"])
+                parts.append(f"{cls}と当たったとき：{len(vs)}戦 勝率{vw / len(vs) * 100:.0f}%")
+        if parts:
+            extra = "\n📎 " + " ／ ".join(parts)
+
+    safe_title = discord.utils.escape_mentions(title)[:80]
+    safe_body = discord.utils.escape_mentions(body)[:800]
+    content = (f"❓ **{safe_title}**\n{safe_body}{extra}\n"
+               f"-# 質問者：{user.mention}（戦績ツールから投稿）")
+    allowed = discord.AllowedMentions(users=[user], roles=False, everyone=False)
+    try:
+        if isinstance(channel, discord.ForumChannel):
+            # フォーラムチャンネルの場合は、投稿（スレッド）として作る
+            created = await channel.create_thread(name=safe_title[:90], content=content, allowed_mentions=allowed)
+            jump_url = created.thread.jump_url if hasattr(created, "thread") else created.jump_url
+        else:
+            message = await channel.send(content, allowed_mentions=allowed)
+            jump_url = message.jump_url
+            try:
+                await message.create_thread(name=safe_title[:90], auto_archive_duration=1440)
+            except discord.HTTPException:
+                pass  # スレッドを作れなくても、質問自体は投稿済み
+    except discord.HTTPException as e:
+        return False, f"投稿に失敗しました（{type(e).__name__}）。運営にお知らせください。", None
+    log.append(now)
+    _QUESTION_LOG[user_id] = log
+    return True, f"{channel.mention} に質問を投稿しました。", jump_url
+
+
+async def post_question(interaction: discord.Interaction, cls: str, title: str, body: str, attach: bool):
+    """Discordの入力画面（モーダル）から呼ばれる。結果は押した人にだけ表示する"""
+    ok, message, url = await submit_question(interaction.client, interaction.user, cls, title, body, attach)
+    text = ("✅ " + message + (f"\n{url}" if url else "")) if ok else ("⏳ " if "間を空けて" in message else "") + message
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+class QuestionModal(discord.ui.Modal):
+    def __init__(self, cls: str, attach: bool):
+        super().__init__(title=("デッキ選びの相談" if cls == CONSULT_KEY else f"{cls}への質問")[:45])
+        self.cls = cls
+        self.attach = attach
+        consult = cls == CONSULT_KEY
+        self.q_title = discord.ui.TextInput(
+            label="題名", max_length=80,
+            placeholder="例：ロイヤルで使うデッキを探しています" if consult else "例：秘術ウィッチへの対策を教えてください",
+        )
+        self.q_body = discord.ui.TextInput(
+            label="内容（使いたいクラス・ランク帯・好み）" if consult else "内容（自分のデッキ・ランク帯・困った場面）",
+            style=discord.TextStyle.paragraph, max_length=800,
+            placeholder=("例：マスター帯です。ロイヤルで、扱いやすいデッキを知りたいです。" if consult
+                         else "例：GMでロイヤルを使っています。後攻のとき、…で困っています。"),
+        )
+        self.add_item(self.q_title)
+        self.add_item(self.q_body)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await post_question(interaction, self.cls, str(self.q_title.value), str(self.q_body.value), self.attach)
+
+
+class QuestionWriteButton(discord.ui.Button):
+    def __init__(self, cls: str, attach: bool):
+        super().__init__(
+            label="戦績を添付して書く" if attach else "質問を書く",
+            emoji="📎" if attach else "✍",
+            style=discord.ButtonStyle.primary if attach else discord.ButtonStyle.secondary,
+        )
+        self.cls = cls
+        self.attach = attach
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(QuestionModal(self.cls, self.attach))
+
+
+class QuestionClassSelect(discord.ui.Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="質問先を選択（クラス別／デッキ選びの相談）",
+            options=[discord.SelectOption(label=c, value=c) for c in CLASS_CHOICES]
+                    + [discord.SelectOption(label="🧭 使うデッキの相談（シャドバ相談所）", value=CONSULT_KEY)],
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        cls = self.values[0]
+        target = "シャドバ相談所" if cls == CONSULT_KEY else f"**{cls}**のチャンネル"
+        if not await class_channel_id(cls):
+            await interaction.response.edit_message(
+                content=f"「{cls}」の質問先がまだ設定されていません。運営にお知らせください。", view=None)
+            return
+        view = discord.ui.View(timeout=300)
+        view.add_item(QuestionWriteButton(cls, attach=True))
+        view.add_item(QuestionWriteButton(cls, attach=False))
+        await interaction.response.edit_message(
+            content=(f"{target}に投稿します。\n"
+                     "📎 戦績を添付すると、あなたの使用デッキ・ランク・現環境の勝率が質問に添えられます（答えが付きやすくなります）。"),
+            view=view,
+        )
+
+
+PANEL_HINT_CUSTOM_ID = "senseki_panel_hint_v1"
+PANEL_ASK_CUSTOM_ID = "senseki_panel_ask_v1"
+
+
+async def show_personal_hint(interaction: discord.Interaction):
+    """自分用の質問のヒントを、押した人にだけ表示する"""
+    matches = await fetch_all_matches(env_only=True)
+    res = compute_personal_hints(matches, str(interaction.user.id))
+    settings = await get_user_settings(str(interaction.user.id))
+    my_class = settings.get("my_class") if settings else None
+    await interaction.response.send_message(
+        build_personal_hint_text(res, await class_channel_map(), my_class), ephemeral=True)
+
+
+async def start_question_flow(interaction: discord.Interaction):
+    """質問先（クラス別チャンネル／シャドバ相談所）の選択画面を、押した人にだけ表示する"""
+    view = discord.ui.View(timeout=300)
+    view.add_item(QuestionClassSelect())
+    await interaction.response.send_message("質問先を選んでください。", view=view, ephemeral=True)
+
+
+class PanelHintButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="質問のヒント", style=discord.ButtonStyle.secondary, emoji="🎯",
+                         custom_id=PANEL_HINT_CUSTOM_ID)
+
+    async def callback(self, interaction: discord.Interaction):
+        await show_personal_hint(interaction)
+
+
+class PanelAskButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="質問・相談する", style=discord.ButtonStyle.secondary, emoji="❓",
+                         custom_id=PANEL_ASK_CUSTOM_ID)
+
+    async def callback(self, interaction: discord.Interaction):
+        await start_question_flow(interaction)
+
+
+class HintPostView(discord.ui.View):
+    """毎週金曜の「質問のヒント」投稿に付くボタン（永続ビュー）"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="自分用のヒントを見る", emoji="🎯", style=discord.ButtonStyle.primary,
+                       custom_id="senseki_hint_personal")
+    async def personal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await show_personal_hint(interaction)
+
+    @discord.ui.button(label="クラスを選んで質問する", emoji="❓", style=discord.ButtonStyle.secondary,
+                       custom_id="senseki_hint_ask")
+    async def ask(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await start_question_flow(interaction)
+
+
 class SensekiCog(commands.Cog):
     # コマンドはグループにまとめている。Discord上は
     #   /戦績 記録 ／ /戦績 設定 …
@@ -3759,10 +4183,22 @@ class SensekiCog(commands.Cog):
             self.daily_sheets_sync.start()
         if not self.debounced_sheets_sync.is_running():
             self.debounced_sheets_sync.start()
+        if not self.hint_post_loop.is_running():
+            self.hint_post_loop.start()
         # 永続ビューの登録。custom_idが一致すれば、BOT再起動後も
         # 過去に送信済みのパネルのボタンが反応し続ける
         self.bot.add_view(SensekiPanelView())
         self.bot.add_view(LegacyPanelView())
+        self.bot.add_view(HintPostView())
+        # Webページ（senseki_web.py があり WEB_SESSION_SECRET が設定されているときだけ起動）
+        try:
+            from senseki_web import start_web
+            if getattr(self, "_web_runner", None) is None:
+                self._web_runner = await start_web(self.bot)
+        except ImportError:
+            pass
+        except Exception as e:
+            print(f"⚠️ Webページの起動に失敗しました（BOT本体は通常どおり動きます）: {type(e).__name__}: {e}")
         # BOT再起動をまたいでも掲示板が最新になるよう一度更新しておく
         try:
             await self._update_board()
@@ -3775,6 +4211,11 @@ class SensekiCog(commands.Cog):
         self.env_report_loop.cancel()
         self.daily_sheets_sync.cancel()
         self.debounced_sheets_sync.cancel()
+        self.hint_post_loop.cancel()
+        runner = getattr(self, "_web_runner", None)
+        if runner is not None:
+            self._web_runner = None
+            asyncio.create_task(runner.cleanup())
 
     @staticmethod
     def _missing_perm_message(interaction: discord.Interaction, what: str) -> str:
@@ -3828,6 +4269,10 @@ class SensekiCog(commands.Cog):
                     "**設定**\n"
                     "・🆕 初回設定\n"
                     "・⚙️ 設定を変える（デッキ切替・ランク更新・フォーマット切替・デッキ検証）\n"
+                    "\n"
+                    "**質問・相談**\n"
+                    "・🎯 質問のヒント（あなたの記録から、聞いてみるとよさそうな相手とおすすめのチャンネルを表示）\n"
+                    "・❓ 質問・相談する（クラス別チャンネル／使うデッキの相談はシャドバ相談所へ投稿）\n"
                     "\n"
                     "**⚠️ 記録の前に確認してください**\n"
                     "記録画面の上部に、今のあなたのデッキとランクが表示されます。\n"
@@ -5027,6 +5472,16 @@ class SensekiCog(commands.Cog):
                 thread_note = f"（スレッドは作れませんでした：BOTに「公開スレッドの作成」権限があるか確認してください / {type(e).__name__}）"
         await set_state(ENV_REPORT_LAST_KEY, f"{env_id}|{g['total']}|{g['users']}")
         await set_state(ENV_REPORT_LAST_DATE_KEY, datetime.now(JST).date().isoformat())
+        if HINT_WITH_REPORT:
+            # レポートの直後に「質問のヒント」を続けて出す（ヒントに使える相手がいなければ出さない）
+            try:
+                hint_matches = await fetch_all_matches(env_only=True)
+                hints, hint_avg = compute_env_hints(hint_matches)
+                if hints:
+                    await channel.send(
+                        build_env_hint_post(hints, hint_avg, await class_channel_map()), view=HintPostView())
+            except Exception as e:
+                print(f"⚠️ 質問のヒントの投稿に失敗しました: {type(e).__name__}: {e}")
         ai_note = ""
         if not ai_text:
             reason = getattr(self, "_last_ai_error", None) or "AIの返答が空でした"
@@ -5167,6 +5622,86 @@ class SensekiCog(commands.Cog):
         await set_state(ENV_REPORT_CHANNEL_KEY, "")
         await interaction.response.send_message(
             "⏸ 環境レポートの自動投稿を止めました。再開するには `/戦績管理 環境レポート設置` を実行してください。",
+            ephemeral=True,
+        )
+
+    # ---- 質問のヒント（毎週金曜の自動投稿） ----
+
+    async def _post_hint(self, force: bool = False):
+        """質問のヒントを設置済みチャンネルに投稿する。戻り値：(投稿したか, 理由)"""
+        channel_id = await get_state(HINT_CHANNEL_KEY)
+        if not channel_id:
+            return False, "投稿先が未設置です。`/戦績管理 質問ヒント設置` を実行してください。"
+        channel = self.bot.get_channel(int(channel_id))
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(int(channel_id))
+            except discord.HTTPException:
+                return False, "投稿先のチャンネルが見つかりません。設置し直してください。"
+        matches = await fetch_all_matches(env_only=True)
+        hints, avg = compute_env_hints(matches)
+        if not hints:
+            return False, (f"ヒントに使える相手がまだありません（{HINT_ENV_MIN_GAMES}戦以上・"
+                           f"記録者{HINT_ENV_MIN_USERS}名以上で、平均より勝ちにくい相手がいる場合に投稿します）。")
+        await channel.send(build_env_hint_post(hints, avg, await class_channel_map()), view=HintPostView())
+        await set_state(HINT_LAST_DATE_KEY, datetime.now(JST).date().isoformat())
+        return True, f"{channel.mention} に投稿しました。"
+
+    @tasks.loop(time=dtime(hour=HINT_POST_HOUR, minute=0, tzinfo=JST))
+    async def hint_post_loop(self):
+        if HINT_WITH_REPORT:
+            return  # 環境レポートと一緒に出す設定のときは、単独の定期投稿はしない
+        now = datetime.now(JST)
+        if now.weekday() != HINT_POST_WEEKDAY:
+            return
+        if await get_state(HINT_LAST_DATE_KEY) == now.date().isoformat():
+            return
+        try:
+            posted, reason = await self._post_hint()
+            if not posted:
+                print(f"ℹ️ 質問のヒントを投稿しませんでした: {reason}")
+        except Exception as e:
+            print(f"⚠️ 質問のヒントの投稿に失敗しました: {type(e).__name__}: {e}")
+
+    @hint_post_loop.before_loop
+    async def _before_hint_post_loop(self):
+        await self.bot.wait_until_ready()
+
+    @admin.command(name="質問ヒント設置", description="「質問のヒント」の単独投稿先をこのチャンネルに設定します（通常は環境レポートと一緒に出ます）")
+    async def hint_setup(self, interaction: discord.Interaction):
+        await set_state(HINT_CHANNEL_KEY, str(interaction.channel_id))
+        await interaction.response.send_message(
+            f"✅ 質問のヒントの投稿先を {interaction.channel.mention} に設定しました。\n"
+            + ("環境レポートの直後に、一緒に投稿されます（この設定は手動投稿用です）。\n" if HINT_WITH_REPORT
+               else f"毎週金曜 {HINT_POST_HOUR}:00 に自動投稿します（ヒントに使える相手がいない週は投稿しません）。\n") +
+            "-# クラス別の質問先は初期設定済みです（変える場合は `/戦績管理 質問先設定`）。今すぐ投稿するには `/戦績管理 質問ヒント投稿`。",
+            ephemeral=True,
+        )
+
+    @admin.command(name="質問ヒント投稿", description="質問のヒントを今すぐ投稿先のチャンネルへ投稿します")
+    async def hint_post_now(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            posted, reason = await self._post_hint(force=True)
+        except Exception as e:
+            posted, reason = False, f"エラーが発生しました：{type(e).__name__}: {e}"
+        await interaction.followup.send(("✅ " if posted else "❌ ") + reason, ephemeral=True)
+
+    @admin.command(name="質問ヒント停止", description="質問のヒントの自動投稿を止めます")
+    async def hint_stop(self, interaction: discord.Interaction):
+        await set_state(HINT_CHANNEL_KEY, "")
+        await interaction.response.send_message("⏸ 質問のヒントの自動投稿を止めました。", ephemeral=True)
+
+    @admin.command(name="質問先設定", description="クラス別の質問の投稿先チャンネルを設定します")
+    @app_commands.describe(クラス="対象クラス（デッキ選びの相談は「シャドバ相談所」）", チャンネル="質問を投稿するチャンネル")
+    @app_commands.choices(クラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES]
+                          + [app_commands.Choice(name="シャドバ相談所", value=CONSULT_KEY)])
+    async def question_channel_setup(self, interaction: discord.Interaction,
+                                     クラス: app_commands.Choice[str], チャンネル: discord.TextChannel):
+        await set_state(QUESTION_CHANNEL_KEY_PREFIX + クラス.value, str(チャンネル.id))
+        await interaction.response.send_message(
+            f"✅ **{クラス.name}** の質問先を {チャンネル.mention} に設定しました。\n"
+            "-# BOTに、そのチャンネルの「メッセージを送信」「公開スレッドを作成」の権限が必要です。",
             ephemeral=True,
         )
 
