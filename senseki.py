@@ -4948,15 +4948,21 @@ async def create_vc_reservation(interaction, asker_id: str, day: str, hhmm: str,
     # 予定を見る場所（イベント機能は知らない人が多いため）にも同じ予定を出す
     thread_url = getattr(target, "jump_url", None) or getattr(question_message, "jump_url", None)
     notice_id = (await get_state(QUESTION_CHANNEL_KEY_PREFIX + VC_NOTICE_KEY)) or VC_NOTICE_DEFAULT
+    notice_error = ""
     try:
         notice_ch = guild.get_channel(int(notice_id)) or await interaction.client.fetch_channel(int(notice_id))
         notice = (f"🗓️ **VC相談の予定**\n日時：{day_txt}（JST）\nVC：{vc.mention}\n"
                   f"テーマ：{title}\n質問者：<@{asker_id}>{comment_line}") if question_message is not None else (
                   f"🗓️ **VCの予定**\n日時：{day_txt}（JST）\nVC：{vc.mention}\n"
                   f"テーマ：{title}\n予約者：<@{asker_id}>{comment_line}")
-        await notice_ch.send(notice, allowed_mentions=discord.AllowedMentions.none())
+        if isinstance(notice_ch, discord.ForumChannel):     # 予定のチャンネルがフォーラムのときは、投稿として作る
+            await notice_ch.create_thread(name=f"VCの予定 {day_txt}"[:90], content=notice,
+                                          allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await notice_ch.send(notice, allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
-        print(f"⚠️ VC予約のお知らせを予定チャンネルに出せませんでした: {type(e).__name__}: {e}")
+        notice_error = f"{type(e).__name__}"
+        print(f"⚠️ VC予約のお知らせを予定チャンネル({notice_id})に出せませんでした: {type(e).__name__}: {e}")
     records.append({"vc": str(vc.id), "s": start.isoformat(), "e": end.isoformat(), "u": asker_id})
     try:
         await _save_vc_reservations(records)
@@ -4964,10 +4970,58 @@ async def create_vc_reservation(interaction, asker_id: str, day: str, hhmm: str,
         print(f"⚠️ VC予約の控えを保存できませんでした: {type(e).__name__}: {e}")
     log.append(now_ts)
     _VC_RESERVE_LOG[asker_id] = log
-    note = "" if event is not None else (
-        "\n※イベントを作る権限がないため、お知らせだけにしました。"
-        + (f"\n（管理者向け：BOTに不足している権限 → {event_hint}）" if event_hint else ""))
+    # 注意書きは管理者にだけ出す（一般のメンバーには、予約できたことだけを見せる）
+    is_admin = bool(getattr(getattr(interaction.user, "guild_permissions", None), "administrator", False))
+    note = ""
+    if is_admin and event is None:
+        note += "\n※Discordのイベントは作られていません。" + (f"\n（BOTに不足している権限 → {event_hint}）" if event_hint else "")
+    if is_admin and notice_error:
+        note += f"\n※予定のチャンネルにお知らせを出せませんでした（{notice_error}）。BOTにそのチャンネルの「メッセージを送信」権限があるか確認してください。"
     return True, f"✅ 予約しました：{day_txt}　{vc.mention}{note}"
+
+
+
+class VCCancelAllView(discord.ui.View):
+    """VC予約の全取消の確認（管理者が押した本人にだけ表示）"""
+
+    def __init__(self):
+        super().__init__(timeout=120)
+
+    @discord.ui.button(label="すべて取り消す", style=discord.ButtonStyle.danger, emoji="🗑️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        records = await _load_vc_reservations()
+        await _save_vc_reservations([])
+        _VC_RESERVE_LOG.clear()
+        deleted = failed = 0
+        guild = interaction.guild
+        if guild is not None:
+            try:
+                events = await guild.fetch_scheduled_events()
+            except discord.HTTPException:
+                events = []
+            bot_id = interaction.client.user.id if interaction.client.user else None
+            for ev in events:
+                mine = (getattr(ev, "creator_id", None) == bot_id) or (ev.name or "").startswith("🎤 ")
+                if not mine:
+                    continue
+                try:
+                    await ev.delete()
+                    deleted += 1
+                except discord.HTTPException:
+                    failed += 1
+        for item in self.children:
+            item.disabled = True
+        text = f"✅ VC予約の控え {len(records)}件を取り消しました。Discordのイベントは {deleted}件を削除しました。"
+        if failed:
+            text += f"\n（{failed}件は削除できませんでした。サーバーの「イベント」から手動で削除してください）"
+        await interaction.edit_original_response(content=text, view=self)
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(content="取り消しをやめました。", view=self)
 
 
 class QuestionVCView(discord.ui.View):
@@ -6791,6 +6845,14 @@ class SensekiCog(commands.Cog):
     async def hint_stop(self, interaction: discord.Interaction):
         await set_state(HINT_CHANNEL_KEY, "")
         await interaction.response.send_message("⏸ 質問のヒントの自動投稿を止めました。", ephemeral=True)
+
+    @admin.command(name="vc予約全取消", description="BOTが受けたVC予約の控えと、BOTが作ったVCのイベントを、すべて取り消します")
+    async def vc_cancel_all(self, interaction: discord.Interaction):
+        view = VCCancelAllView()
+        await interaction.response.send_message(
+            "⚠️ **VC予約を、すべて取り消します。** BOTが受けた予約の控えと、BOTが作った「🎤」から始まるイベントが、対象です。\n"
+            "予定のチャンネルに出たお知らせの文は、消えません（手動で削除してください）。よろしいですか？",
+            view=view, ephemeral=True)
 
     @admin.command(name="質問先設定", description="クラス別の質問の投稿先チャンネルを設定します")
     @app_commands.describe(クラス="対象クラス（デッキ選びの相談は「シャドバ相談所」、VCの予約に使うVCは「相談VC①〜③」）",
