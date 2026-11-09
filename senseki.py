@@ -4703,6 +4703,23 @@ async def consult_vc_ids() -> list:
 _WEEKDAY_JA = "月火水木金土日"
 
 
+VC_RES_STATE_KEY = "vc_reservations"
+
+
+async def _load_vc_reservations() -> list:
+    """BOTが受けたVC予約の控え（イベントを作れない場合でも、先着の判定ができるようにする）"""
+    try:
+        data = json.loads(await get_state(VC_RES_STATE_KEY) or "[]")
+    except Exception:
+        data = []
+    cutoff = (datetime.now(JST) - timedelta(hours=6)).isoformat()
+    return [r for r in data if isinstance(r, dict) and r.get("e", "") > cutoff]
+
+
+async def _save_vc_reservations(items: list):
+    await set_state(VC_RES_STATE_KEY, json.dumps(items, ensure_ascii=False))
+
+
 class VCReserveView(discord.ui.View):
     """質問者が、日・時刻・VCを選んで相談の予約を入れる画面（押した人にだけ表示）"""
 
@@ -4827,8 +4844,17 @@ async def create_vc_reservation(interaction, asker_id: str, day: str, hhmm: str,
     except discord.HTTPException:
         events = []
 
+    records = await _load_vc_reservations()
+
     def busy_at(channel_id: int):
         """その時間に、このVCで重なる予約があれば、その開始時刻を返す"""
+        for r in records:
+            try:
+                r_s, r_e = datetime.fromisoformat(r["s"]), datetime.fromisoformat(r["e"])
+            except Exception:
+                continue
+            if str(r.get("vc")) == str(channel_id) and r_s < end and r_e > start:
+                return r_s.astimezone(JST)
         for ev in events:
             if getattr(ev, "channel_id", None) != channel_id:
                 continue
@@ -4898,6 +4924,11 @@ async def create_vc_reservation(interaction, asker_id: str, day: str, hhmm: str,
         await notice_ch.send(notice, allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
         print(f"⚠️ VC予約のお知らせを予定チャンネルに出せませんでした: {type(e).__name__}: {e}")
+    records.append({"vc": str(vc.id), "s": start.isoformat(), "e": end.isoformat(), "u": asker_id})
+    try:
+        await _save_vc_reservations(records)
+    except Exception as e:
+        print(f"⚠️ VC予約の控えを保存できませんでした: {type(e).__name__}: {e}")
     log.append(now_ts)
     _VC_RESERVE_LOG[asker_id] = log
     note = "" if event is not None else "\n※イベントを作る権限がないため、お知らせだけにしました。"
