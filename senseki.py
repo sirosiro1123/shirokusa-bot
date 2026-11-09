@@ -4624,7 +4624,9 @@ VC_SLOT_KEYS = ["vc1", "vc2", "vc3"]              # 質問先設定 の「相談
 VC_NOTICE_KEY = "vcnotice"                        # 質問先設定 の「VC予約のお知らせ先」
 VC_NOTICE_DEFAULT = "1467189822350295213"         # VC予約を知らせるチャンネルの初期値（予定を見る場所）
 VC_RESERVE_DAILY_LIMIT = 2       # 1人が1日に予約できる回数
-VC_RESERVE_MINUTES = 60          # 1回の予約の長さ
+VC_RESERVE_MINUTES = 120         # 1回の予約の長さ（1人2時間確保）
+VC_DEFAULT_IDS = ["1208804697801236564", "1407176497084629122"]   # 全クラス共通の相談VC（シャドバビヨンドVC／VC2）。先着順
+VC_AUTO = "auto"                 # 「空いている方におまかせ」
 VC_RESERVE_DAYS = 4              # 今日から何日先まで予約できるか
 VC_START_HOURS = list(range(12, 24))               # 予約できる開始の「時」（12時〜23時）
 VC_START_MINUTES = [0, 15, 30, 45]                 # 予約できる開始の「分」（15分刻み）
@@ -4688,12 +4690,13 @@ def build_question_embed(user_id: str, cls: str, rows: list, settings: dict = No
 
 
 async def consult_vc_ids() -> list:
+    """相談に使うVC。管理者が設定していればそれを、なければ既定の2つ（全クラス共通）を使う"""
     out = []
     for k in VC_SLOT_KEYS:
         v = await get_state(QUESTION_CHANNEL_KEY_PREFIX + k)
         if v:
             out.append(str(v))
-    return out
+    return out or list(VC_DEFAULT_IDS)
 
 
 _WEEKDAY_JA = "月火水木金土日"
@@ -4724,9 +4727,11 @@ class VCReserveView(discord.ui.View):
         self.day_sel = discord.ui.Select(placeholder="① 日にちを選ぶ", options=day_opts, row=0)
         self.hour_sel = discord.ui.Select(placeholder="② 開始の「時」を選ぶ", options=hour_opts, row=1)
         self.minute_sel = discord.ui.Select(placeholder="③ 開始の「分」を選ぶ（15分刻み）", options=minute_opts, row=2)
-        self.vc_sel = discord.ui.Select(
-            placeholder="④ VCを選ぶ", row=3,
-            options=[discord.SelectOption(label=name[:100], value=cid) for cid, name in vc_options])
+        vc_opts = [discord.SelectOption(label=name[:100], value=cid) for cid, name in vc_options]
+        if len(vc_opts) > 1:
+            vc_opts.insert(0, discord.SelectOption(label="空いている方（おまかせ）", value=VC_AUTO,
+                                                   description="先に空いているVCを取ります"))
+        self.vc_sel = discord.ui.Select(placeholder="④ VCを選ぶ", row=3, options=vc_opts)
         self.day_sel.callback = self._on_day
         self.hour_sel.callback = self._on_hour
         self.minute_sel.callback = self._on_minute
@@ -4807,21 +4812,37 @@ async def create_vc_reservation(interaction, asker_id: str, day: str, hhmm: str,
     end = start + timedelta(minutes=VC_RESERVE_MINUTES)
     if start < datetime.now(JST) + timedelta(minutes=5):
         return False, "5分以内、または過ぎた時刻は予約できません。もう少し先の時刻を選んでください。"
-    vc = guild.get_channel(int(vc_id))
-    if vc is None:
-        return False, "選んだVCが見つかりません。運営にお知らせください。"
     try:
         events = await guild.fetch_scheduled_events()
     except discord.HTTPException:
         events = []
-    for ev in events:
-        if getattr(ev, "channel_id", None) != vc.id:
-            continue
-        ev_end = ev.end_time or (ev.start_time + timedelta(minutes=VC_RESERVE_MINUTES))
-        if ev.start_time < end and ev_end > start:
-            ev_start = ev.start_time.astimezone(JST)
-            return False, (f"{vc.name} は、{ev_start.month}/{ev_start.day} {ev_start:%H:%M}から予約が入っています。"
-                           "別の時刻か、別のVCを選んでください。")
+
+    def busy_at(channel_id: int):
+        """その時間に、このVCで重なる予約があれば、その開始時刻を返す"""
+        for ev in events:
+            if getattr(ev, "channel_id", None) != channel_id:
+                continue
+            ev_end = ev.end_time or (ev.start_time + timedelta(minutes=VC_RESERVE_MINUTES))
+            if ev.start_time < end and ev_end > start:
+                return ev.start_time.astimezone(JST)
+        return None
+
+    candidates = []
+    for cid in (await consult_vc_ids() if vc_id == VC_AUTO else [vc_id]):
+        ch_ = guild.get_channel(int(cid))
+        if ch_ is not None:
+            candidates.append(ch_)
+    if not candidates:
+        return False, "選んだVCが見つかりません。運営にお知らせください。"
+    vc = next((c for c in candidates if busy_at(c.id) is None), None)
+    if vc is None:
+        if vc_id == VC_AUTO:
+            return False, "その時間は、どのVCも予約で埋まっています。別の時刻を選んでください。"
+        # 選んだVCが埋まっているとき、もう片方が空いていれば教える
+        others = [g for g in [guild.get_channel(int(c)) for c in await consult_vc_ids()]
+                  if g is not None and g.id != candidates[0].id and busy_at(g.id) is None]
+        hint = f"{others[0].name} は空いています。" if others else "どちらのVCも埋まっています。"
+        return False, f"{candidates[0].name} は、その時間は予約で埋まっています。{hint}別の時刻かVCを選んでください。"
     day_txt = f"{d.month}/{d.day}（{_WEEKDAY_JA[d.weekday()]}） {h}:{m:02d}〜"
     comment = discord.utils.escape_mentions((comment or "").strip())[:100]
     comment_line = f"\nひとこと：{comment}" if comment else ""
@@ -4899,7 +4920,7 @@ class QuestionVCView(discord.ui.View):
         first_line = (msg.content or "").split("\n")[0].replace("❓", "").replace("*", "").strip()
         view = VCReserveView(str(asker), options, msg, first_line or "質問")
         await interaction.response.send_message(
-            "🎤 **VCで相談する日時を選んでください**（今日から4日先まで）\n"
+            "🎤 **VCで相談する日時を選んでください**（今日から4日先まで・1人2時間確保・先着順）\n"
             "予約すると、Discordの「イベント」が作られ、スレッドにお知らせが出ます。", view=view, ephemeral=True)
 
 
