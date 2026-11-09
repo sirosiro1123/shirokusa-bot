@@ -42,6 +42,7 @@ senseki.py
     記事登録／記事一覧／記事削除  対面ごとのおすすめ記事URLの管理
     質問ヒント設置／投稿／停止  毎週金曜20時に「質問のヒント」を自動投稿（AIなし）。ボタンで個人用ヒントとクラス別質問
     質問先設定    クラスごとの質問の投稿先チャンネルを設定
+    記録管理      修正・削除の履歴確認／削除済み記録の確認／IDを指定した復元
 
 【データの保存先について】
   Railwayの永続ボリュームのマウント先はプロジェクトによって異なる
@@ -78,10 +79,13 @@ Railwayのログに出る「戦績ツール ストレージ診断」を見て、
 """
 
 import asyncio
+import json
 import io
 import os
 import sqlite3
 from datetime import datetime, time as dtime, timedelta, timezone
+
+from typing import Union
 
 import discord
 
@@ -652,6 +656,45 @@ def _init_db_sync():
             "ON personal_deck_variants(match_id)"
         )
 
+        # 削除した記録の退避先（matches と同じ列＋削除日時）。集計・シート・レポートは matches しか見ないので、
+        # ここに移した記録は自動的に集計から外れ、復元すると元の id のまま matches に戻る
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS matches_deleted (
+                id INTEGER PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                env_id TEXT NOT NULL,
+                format TEXT NOT NULL,
+                my_class TEXT NOT NULL,
+                my_deck TEXT,
+                rank_tier TEXT,
+                cr_grade TEXT,
+                opp_class TEXT NOT NULL,
+                opp_deck TEXT,
+                is_first INTEGER NOT NULL,
+                is_win INTEGER NOT NULL,
+                deleted_at TEXT NOT NULL,
+                variant_label TEXT
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_matches_deleted_user ON matches_deleted(user_id, deleted_at)"
+        )
+        # 修正・削除・復元の履歴（管理者がいじり方を確認するため）
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS match_edit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                at TEXT NOT NULL,
+                action TEXT NOT NULL,
+                source TEXT NOT NULL,
+                before_json TEXT,
+                after_json TEXT
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_match_edit_log_user ON match_edit_log(user_id, at)")
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS guide_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1013,20 +1056,222 @@ async def update_format(user_id: str, format_: str) -> bool:
     return await asyncio.to_thread(_update_format_sync, user_id, format_)
 
 
+# ---- 記録の修正・削除・復元（本人用。管理者は履歴を確認できる） ----
+EDIT_DAILY_LIMIT = 20          # 1人が1日に「修正＋削除」できる件数（直後の取り消しは数えない）
+RESTORE_DAYS = 7               # 削除した記録を本人が戻せる期間
+MATCH_COLS = ("user_id", "recorded_at", "env_id", "format", "my_class", "my_deck", "rank_tier",
+              "cr_grade", "opp_class", "opp_deck", "is_first", "is_win")
+
+
+def _log_edit(conn, match_id: int, user_id: str, action: str, source: str, before=None, after=None):
+    conn.execute(
+        "INSERT INTO match_edit_log (match_id, user_id, at, action, source, before_json, after_json) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (match_id, user_id, datetime.now(JST).isoformat(), action, source,
+         json.dumps(before, ensure_ascii=False) if before is not None else None,
+         json.dumps(after, ensure_ascii=False) if after is not None else None),
+    )
+
+
+def _soft_delete_core(conn, user_id: str, match_id: int, action: str, source: str):
+    """本人の記録を matches から退避テーブルへ移す。戻り値は従来の取消と同じ形（id/opp_class/is_win/recorded_at）"""
+    row = conn.execute("SELECT * FROM matches WHERE id = ? AND user_id = ?", (match_id, user_id)).fetchone()
+    if row is None:
+        return None
+    var = conn.execute("SELECT variant_label FROM personal_deck_variants WHERE match_id = ?", (match_id,)).fetchone()
+    cols = ", ".join(("id",) + MATCH_COLS)
+    conn.execute(
+        f"INSERT OR REPLACE INTO matches_deleted ({cols}, deleted_at, variant_label) "
+        f"VALUES ({', '.join('?' * (len(MATCH_COLS) + 1))}, ?, ?)",
+        [row["id"]] + [row[c] for c in MATCH_COLS] + [datetime.now(JST).isoformat(), var["variant_label"] if var else None],
+    )
+    conn.execute("DELETE FROM matches WHERE id = ?", (match_id,))
+    conn.execute("DELETE FROM personal_deck_variants WHERE match_id = ?", (match_id,))
+    _log_edit(conn, match_id, user_id, action, source, before={k: row[k] for k in MATCH_COLS})
+    conn.commit()
+    return {"id": row["id"], "opp_class": row["opp_class"], "is_win": row["is_win"], "recorded_at": row["recorded_at"]}
+
+
+def _edits_today(conn, user_id: str) -> int:
+    today = datetime.now(JST).date().isoformat()
+    return conn.execute(
+        "SELECT COUNT(*) FROM match_edit_log WHERE user_id = ? AND at LIKE ? AND action IN ('edit', 'delete')",
+        (user_id, today + "%"),
+    ).fetchone()[0]
+
+
+def _limit_message() -> str:
+    return f"1日に修正・削除できるのは{EDIT_DAILY_LIMIT}件までです。日付が変わるとまた使えます。"
+
+
+def _edit_match_sync(user_id: str, match_id: int, fields: dict, source: str):
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM matches WHERE id = ? AND user_id = ?", (match_id, user_id)).fetchone()
+        if row is None:
+            return False, "記録が見つかりません。", None
+        if row["env_id"] != current_env_id():
+            return False, "前の環境の記録は、修正・削除できません。", None
+        keys = ("opp_class", "opp_deck", "is_first", "is_win")
+        before = {k: row[k] for k in keys}
+        after = {"opp_class": fields["opp_class"], "opp_deck": fields.get("opp_deck") or None,
+                 "is_first": 1 if fields["is_first"] else 0, "is_win": 1 if fields["is_win"] else 0}
+        if before == after:
+            return False, "変更がありません。", None
+        if _edits_today(conn, user_id) >= EDIT_DAILY_LIMIT:
+            return False, _limit_message(), None
+        conn.execute(
+            "UPDATE matches SET opp_class = ?, opp_deck = ?, is_first = ?, is_win = ? WHERE id = ? AND user_id = ?",
+            (after["opp_class"], after["opp_deck"], after["is_first"], after["is_win"], match_id, user_id),
+        )
+        _register_deck_name(conn, after["opp_class"], after["opp_deck"])
+        _log_edit(conn, match_id, user_id, "edit", source, before, after)
+        conn.commit()
+        return True, "修正しました。", after
+    finally:
+        conn.close()
+
+
+async def edit_match(user_id: str, match_id: int, fields: dict, source: str = "discord"):
+    res = await asyncio.to_thread(_edit_match_sync, user_id, match_id, fields, source)
+    if res[0]:
+        mark_dirty()
+    return res
+
+
+def _delete_match_checked_sync(user_id: str, match_id: int, source: str):
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT env_id FROM matches WHERE id = ? AND user_id = ?", (match_id, user_id)).fetchone()
+        if row is None:
+            return False, "記録が見つかりません。", None
+        if row["env_id"] != current_env_id():
+            return False, "前の環境の記録は、修正・削除できません。", None
+        if _edits_today(conn, user_id) >= EDIT_DAILY_LIMIT:
+            return False, _limit_message(), None
+        res = _soft_delete_core(conn, user_id, match_id, "delete", source)
+        return True, "削除しました。", res
+    finally:
+        conn.close()
+
+
+async def delete_match_checked(user_id: str, match_id: int, source: str = "discord"):
+    res = await asyncio.to_thread(_delete_match_checked_sync, user_id, match_id, source)
+    if res[0]:
+        mark_dirty()
+    return res
+
+
+def _restore_match_sync(user_id: str, match_id: int, source: str, admin: bool = False):
+    conn = _connect()
+    try:
+        row = conn.execute("SELECT * FROM matches_deleted WHERE id = ?", (match_id,)).fetchone()
+        if row is None or (not admin and row["user_id"] != user_id):
+            return False, "戻せる記録が見つかりません。", None
+        if not admin:
+            if row["env_id"] != current_env_id():
+                return False, "前の環境の記録は戻せません。", None
+            if datetime.now(JST) - datetime.fromisoformat(row["deleted_at"]) > timedelta(days=RESTORE_DAYS):
+                return False, f"削除から{RESTORE_DAYS}日を過ぎた記録は、自分では戻せません。管理者に相談してください。", None
+        if conn.execute("SELECT 1 FROM matches WHERE id = ?", (match_id,)).fetchone():
+            return False, "この記録はすでに戻されています。", None
+        cols = ", ".join(("id",) + MATCH_COLS)
+        conn.execute(
+            f"INSERT INTO matches ({cols}) VALUES ({', '.join('?' * (len(MATCH_COLS) + 1))})",
+            [row["id"]] + [row[c] for c in MATCH_COLS],
+        )
+        if row["variant_label"]:
+            conn.execute(
+                "INSERT OR IGNORE INTO personal_deck_variants (match_id, user_id, variant_label, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (row["id"], row["user_id"], row["variant_label"], datetime.now(JST).isoformat()),
+            )
+        conn.execute("DELETE FROM matches_deleted WHERE id = ?", (match_id,))
+        _log_edit(conn, match_id, row["user_id"], "admin_restore" if admin else "restore", source,
+                  after={k: row[k] for k in MATCH_COLS})
+        conn.commit()
+        return True, "元に戻しました。", dict(row)
+    finally:
+        conn.close()
+
+
+async def restore_match(user_id: str, match_id: int, source: str = "discord", admin: bool = False):
+    res = await asyncio.to_thread(_restore_match_sync, user_id, match_id, source, admin)
+    if res[0]:
+        mark_dirty()
+    return res
+
+
+def _list_user_matches_sync(user_id: str, limit: int, deleted: bool):
+    conn = _connect()
+    try:
+        if deleted:
+            since = (datetime.now(JST) - timedelta(days=RESTORE_DAYS)).isoformat()
+            rows = conn.execute(
+                "SELECT * FROM matches_deleted WHERE user_id = ? AND env_id = ? AND deleted_at >= ? "
+                "ORDER BY deleted_at DESC LIMIT ?", (user_id, current_env_id(), since, limit)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM matches WHERE user_id = ? AND env_id = ? ORDER BY id DESC LIMIT ?",
+                (user_id, current_env_id(), limit)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+async def list_user_matches(user_id: str, limit: int = 10, deleted: bool = False):
+    return await asyncio.to_thread(_list_user_matches_sync, user_id, limit, deleted)
+
+
+async def get_user_match(user_id: str, match_id: int):
+    rows = await asyncio.to_thread(_list_user_matches_sync, user_id, 500, False)
+    return next((r for r in rows if r["id"] == match_id), None)
+
+
+def _edit_report_sync(days: int):
+    conn = _connect()
+    try:
+        since = (datetime.now(JST) - timedelta(days=days)).isoformat()
+        logs = conn.execute(
+            "SELECT * FROM match_edit_log WHERE at >= ? ORDER BY id", (since,)).fetchall()
+        users: dict = {}
+        for r in logs:
+            u = users.setdefault(r["user_id"], {"edit": 0, "delete": 0, "undo": 0, "restore": 0,
+                                                "del_lose": 0, "to_win": 0, "web": 0})
+            a = r["action"]
+            if a in ("restore", "admin_restore"):
+                u["restore"] += 1
+            elif a in u:
+                u[a] += 1
+            if r["source"] == "web":
+                u["web"] += 1
+            try:
+                b = json.loads(r["before_json"]) if r["before_json"] else {}
+                af = json.loads(r["after_json"]) if r["after_json"] else {}
+            except ValueError:
+                continue
+            if a == "delete" and b.get("is_win") == 0:
+                u["del_lose"] += 1
+            if a == "edit" and b.get("is_win") == 0 and af.get("is_win") == 1:
+                u["to_win"] += 1
+        return users
+    finally:
+        conn.close()
+
+
+async def edit_report(days: int = 7):
+    return await asyncio.to_thread(_edit_report_sync, days)
+
+
 def _delete_last_match_sync(user_id: str):
     conn = _connect()
     try:
         row = conn.execute(
-            "SELECT id, opp_class, is_win, recorded_at FROM matches "
-            "WHERE user_id = ? ORDER BY id DESC LIMIT 1",
-            (user_id,),
+            "SELECT id FROM matches WHERE user_id = ? ORDER BY id DESC LIMIT 1", (user_id,),
         ).fetchone()
         if row is None:
             return None
-        conn.execute("DELETE FROM matches WHERE id = ?", (row["id"],))
-        conn.execute("DELETE FROM personal_deck_variants WHERE match_id = ?", (row["id"],))
-        conn.commit()
-        return dict(row)
+        return _soft_delete_core(conn, user_id, row["id"], "undo", "discord")
     finally:
         conn.close()
 
@@ -1039,19 +1284,10 @@ async def delete_last_match(user_id: str):
 
 
 def _delete_match_by_id_sync(user_id: str, match_id: int):
-    """記録完了画面の「取り消す」用。本人の記録だけを消す"""
+    """記録完了画面の「取り消す」用。本人の記録だけを消す（実際は退避テーブルへ移す）"""
     conn = _connect()
     try:
-        row = conn.execute(
-            "SELECT id, opp_class, is_win, recorded_at FROM matches WHERE id = ? AND user_id = ?",
-            (match_id, user_id),
-        ).fetchone()
-        if row is None:
-            return None
-        conn.execute("DELETE FROM matches WHERE id = ?", (row["id"],))
-        conn.execute("DELETE FROM personal_deck_variants WHERE match_id = ?", (row["id"],))
-        conn.commit()
-        return dict(row)
+        return _soft_delete_core(conn, user_id, match_id, "undo", "discord")
     finally:
         conn.close()
 
@@ -1645,6 +1881,119 @@ def build_personal_ai_dataset(settings: dict, mine: list, everyone: list) -> str
         lines.append("")
         lines.append(f"■ 調子：直近{rn}戦の勝率{rr:.1f}%／それより前{bn}戦の勝率{br:.1f}%")
     return "\n".join(lines)
+
+
+# ---- AI分析に添える画像：「もう少し勝率を上げたい対面」 ----
+IMPROVE_MAX_ROWS = 5        # 画像に出す対面の数
+IMPROVE_MIN_GAMES = AI_PERSONAL_MIN_PAIR   # 対面ごとにこの試合数以上のものだけ
+IMPROVE_MIN_GAP = 5.0       # 自分の平均より、これ以上（ポイント）低い対面だけ
+IMPROVE_SMALL_SAMPLE = 15   # これ未満の試合数には「試合数が少ない」の印をつける
+
+
+def compute_improve_rows(mine: list, everyone: list):
+    """
+    「当たる回数が多く、自分の平均より勝率が低い対面」を、伸びしろの大きい順に返す。
+    伸びしろ＝その対面の勝率を自分の平均まで上げたときに増える勝ち数（試合数×差）。
+    相手デッキ名の記録が少ないときは、相手クラス別にする。
+    戻り値：{"rows": [...], "level": "deck"|"class", "base": 自分の平均勝率, "n": 試合数} か None
+    """
+    n = len(mine)
+    if n == 0:
+        return None
+    base = sum(1 for r in mine if r["is_win"]) / n * 100
+
+    def build(keyfunc, labelfunc):
+        groups: dict = {}
+        for r in mine:
+            k = keyfunc(r)
+            if k is not None:
+                groups.setdefault(k, []).append(r)
+        others: dict = {}
+        for r in everyone:
+            k = keyfunc(r)
+            if k is not None:
+                others.setdefault(k, []).append(r)
+        rows = []
+        for k, rs in groups.items():
+            g = len(rs)
+            if g < IMPROVE_MIN_GAMES:
+                continue
+            rate = sum(1 for r in rs if r["is_win"]) / g * 100
+            gap = base - rate
+            if gap < IMPROVE_MIN_GAP:
+                continue
+            o = others.get(k, [])
+            orate = sum(1 for r in o if r["is_win"]) / len(o) * 100 if len(o) >= IMPROVE_MIN_GAMES else None
+            rows.append({"label": labelfunc(k), "games": g, "wins": sum(1 for r in rs if r["is_win"]),
+                         "rate": rate, "gap": gap, "potential": g * gap / 100, "others": orate})
+        rows.sort(key=lambda x: -x["potential"])
+        return rows[:IMPROVE_MAX_ROWS]
+
+    rows = build(lambda r: (r["opp_class"], r["opp_deck"]) if r.get("opp_deck") else None,
+                 lambda k: f"{k[1]}（{k[0]}）")
+    level = "deck"
+    if len(rows) < 2:
+        class_rows = build(lambda r: r["opp_class"], lambda k: k)
+        if len(class_rows) > len(rows):
+            rows, level = class_rows, "class"
+    if not rows:
+        return None
+    return {"rows": rows, "level": level, "base": base, "n": n}
+
+
+def render_improve_chart(deck_label: str, result: dict):
+    """勝率を上げたい対面の横棒グラフ。フォント未導入などの場合は None"""
+    if plt is None or _JP_FONT_NAME is None or not result or not result["rows"]:
+        return None
+    try:
+        rows = list(reversed(result["rows"]))      # barhは先頭が下に積まれるので、優先度が高いものを上に
+        base = result["base"]
+        height = max(3.0, 0.95 * len(rows) + 1.8)
+        fig, ax = plt.subplots(figsize=(8.2, height), dpi=150)
+        y = list(range(len(rows)))
+        colors = ["#d9534f" if r["gap"] >= 12 else "#f0ad4e" for r in rows]
+        ax.barh(y, [r["rate"] for r in rows], color=colors, edgecolor="#333333", linewidth=0.5, height=0.62, zorder=2)
+        ax.axvline(base, color="#2b6cb0", linestyle="--", linewidth=1.6, zorder=3)
+        ax.set_xlim(0, 140)
+        ax.set_ylim(-0.6, len(rows) - 0.2 + 0.45)
+        ax.text(base, len(rows) - 0.2 + 0.4, f"あなたの平均 {base:.0f}%", color="#2b6cb0", fontsize=10,
+                ha="center", va="top", weight="bold", zorder=5,
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.95))
+        ax.set_xticks([0, 20, 40, 60, 80, 100])
+        ax.set_yticks(y)
+        ax.set_yticklabels([("★ " if i == len(rows) - 1 else "") + r["label"] for i, r in enumerate(rows)], fontsize=12)
+        ax.set_xlabel("あなたの勝率（%）", fontsize=11)
+        box = dict(boxstyle="round,pad=0.12", fc="white", ec="none", alpha=0.92)
+        for yi, r in zip(y, rows):
+            x0 = max(r["rate"], 0) + 2
+            ax.text(x0, yi + 0.2, f"{r['rate']:.0f}%（{r['wins']}勝{r['games'] - r['wins']}敗）",
+                    va="center", ha="left", fontsize=11, color="#222222", weight="bold", zorder=4, bbox=box)
+            ax.text(x0, yi - 0.02, f"平均より{r['gap']:.0f}pt低い／あと約{r['potential']:.1f}勝分",
+                    va="center", ha="left", fontsize=8.8, color="#444444", zorder=4, bbox=box)
+            extra = []
+            if r["others"] is not None:
+                extra.append(f"同じデッキのほかの人 {r['others']:.0f}%")
+            if r["games"] < IMPROVE_SMALL_SAMPLE:
+                extra.append("※試合数が少ない")
+            if extra:
+                ax.text(x0, yi - 0.22, "　".join(extra), va="center", ha="left", fontsize=8.4, color="#666666",
+                        zorder=4, bbox=box)
+        scope = "相手デッキ別" if result["level"] == "deck" else "相手クラス別（デッキ名の記録が少ないため）"
+        ax.set_title(f"{deck_label}　もう少し勝率を上げたい対面", fontsize=14, pad=26)
+        ax.text(0.0, 1.04, f"{scope}・当たる回数が多く、平均より勝率が低い順（★が一番の伸びしろ）",
+                transform=ax.transAxes, fontsize=9.5, color="#666666", ha="left", va="bottom")
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(axis="x", color="#e5e5e5", zorder=0)
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png")
+        plt.close(fig)
+        buf.seek(0)
+        return buf
+    except Exception as e:
+        print(f"⚠️ 勝率を上げたい対面の画像作成に失敗: {type(e).__name__}: {e}")
+        return None
 
 
 # AIの呼び出しに使うモデルが返答できなかったときの予備（Haiku）
@@ -3327,6 +3676,273 @@ class PanelAIButton(discord.ui.Button):
         await cog._show_personal_ai(interaction)
 
 
+# ---- 記録の確認・修正・削除・復元（Discord） ----
+PANEL_RECORDS_CUSTOM_ID = "senseki_panel_records_v1"
+NO_DECK_VALUE = "__none__"
+
+
+def _match_label(m: dict) -> str:
+    wl = "勝" if m["is_win"] else "負"
+    deck = f"({m['opp_deck']})" if m.get("opp_deck") else ""
+    ts = (m.get("recorded_at") or "")[5:16].replace("T", " ").replace("-", "/")
+    return f"{wl} vs {m['opp_class']}{deck} {'先' if m['is_first'] else '後'} {ts}"[:100]
+
+
+def _match_summary(cls: str, deck, is_first: bool, is_win: bool) -> str:
+    d = f"（{deck}）" if deck else ""
+    return f"{'勝ち' if is_win else '負け'}／{cls}{d}／{'先攻' if is_first else '後攻'}"
+
+
+def _web_url_button():
+    base = os.environ.get("WEB_BASE_URL", "").rstrip("/")
+    if not base:
+        return None
+    return discord.ui.Button(label="Webで見る", style=discord.ButtonStyle.link, url=base, emoji="🌐", row=2)
+
+
+async def build_record_list(user_id: str):
+    rows = await list_user_matches(user_id, 10)
+    lines = ["📋 **あなたの直近の記録**（今の環境・新しい順・10件まで）"]
+    if rows:
+        lines.append("修正・削除したい記録を、下から選んでください。")
+    else:
+        lines.append("まだ今の環境の記録がありません。")
+    lines.append(f"-# 修正と削除は1日{EDIT_DAILY_LIMIT}件まで。削除しても{RESTORE_DAYS}日以内なら自分で戻せます。前の環境の記録は変更できません。")
+    return "\n".join(lines), RecordListView(user_id, rows)
+
+
+class RecordPickSelect(discord.ui.Select):
+    def __init__(self, rows):
+        super().__init__(
+            placeholder="修正・削除する記録を選ぶ",
+            options=[discord.SelectOption(label=_match_label(m), value=str(m["id"])) for m in rows[:25]],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        m = await get_user_match(uid, int(self.values[0]))
+        if m is None:
+            await interaction.response.send_message("記録が見つかりません。", ephemeral=True)
+            return
+        view = RecordEditView(uid, m)
+        await view.refresh_deck_options()
+        await interaction.response.edit_message(content=view.content(), view=view)
+
+
+class RecordListView(discord.ui.View):
+    def __init__(self, user_id: str, rows):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        if rows:
+            self.add_item(RecordPickSelect(rows))
+        self.add_item(RecordRestoreOpenButton())
+        link = _web_url_button()
+        if link is not None:
+            self.add_item(link)
+
+
+class RecordRestoreOpenButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="削除した記録を戻す", style=discord.ButtonStyle.secondary, emoji="♻️", row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        uid = str(interaction.user.id)
+        rows = await list_user_matches(uid, 10, deleted=True)
+        if not rows:
+            await interaction.response.send_message(
+                f"戻せる記録はありません（削除から{RESTORE_DAYS}日以内・今の環境の記録だけ）。", ephemeral=True)
+            return
+        view = discord.ui.View(timeout=300)
+        view.add_item(RecordRestoreSelect(rows))
+        view.add_item(RecordBackButton())
+        await interaction.response.edit_message(
+            content="♻️ **削除した記録**（新しい順）\n戻したい記録を選ぶと、すぐに元に戻ります。", view=view)
+
+
+class RecordRestoreSelect(discord.ui.Select):
+    def __init__(self, rows):
+        super().__init__(
+            placeholder="戻す記録を選ぶ",
+            options=[discord.SelectOption(label=_match_label(m), value=str(m["id"])) for m in rows[:25]],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        ok, msg, _ = await restore_match(str(interaction.user.id), int(self.values[0]), "discord")
+        view = discord.ui.View(timeout=120)
+        view.add_item(RecordBackButton())
+        await interaction.response.edit_message(content=("✅ " if ok else "⚠️ ") + msg, view=view)
+
+
+class RecordBackButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="一覧に戻る", style=discord.ButtonStyle.secondary, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        content, view = await build_record_list(str(interaction.user.id))
+        await interaction.response.edit_message(content=content, view=view)
+
+
+class RecordClassSelect(discord.ui.Select):
+    def __init__(self, current: str):
+        super().__init__(
+            placeholder="相手のクラス",
+            options=[discord.SelectOption(label=c, value=c, default=(c == current)) for c in CLASS_CHOICES],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        v: RecordEditView = self.view
+        if self.values[0] != v.cls:
+            v.cls = self.values[0]
+            v.deck = None
+            await v.refresh_deck_options()
+        await interaction.response.edit_message(content=v.content(), view=v)
+
+
+class RecordDeckSelect(discord.ui.Select):
+    def __init__(self, names, current):
+        opts = [discord.SelectOption(label="（デッキなし／不明）", value=NO_DECK_VALUE, default=not current)]
+        for n in names[:24]:
+            opts.append(discord.SelectOption(label=n[:100], value=n, default=(n == current)))
+        super().__init__(placeholder="相手のデッキ", options=opts, row=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        v: RecordEditView = self.view
+        v.deck = None if self.values[0] == NO_DECK_VALUE else self.values[0]
+        await v.refresh_deck_options()
+        await interaction.response.edit_message(content=v.content(), view=v)
+
+
+class RecordToggleButton(discord.ui.Button):
+    def __init__(self, key: str, value: bool, label: str):
+        super().__init__(label=label, row=2)
+        self.key, self.value = key, value
+
+    async def callback(self, interaction: discord.Interaction):
+        v: RecordEditView = self.view
+        setattr(v, self.key, self.value)
+        v.sync_buttons()
+        await interaction.response.edit_message(content=v.content(), view=v)
+
+
+class RecordSaveButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="保存", style=discord.ButtonStyle.success, emoji="💾", row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        v: RecordEditView = self.view
+        ok, msg, _ = await edit_match(v.user_id, v.match["id"], {
+            "opp_class": v.cls, "opp_deck": v.deck, "is_first": v.is_first, "is_win": v.is_win}, "discord")
+        back = discord.ui.View(timeout=120)
+        back.add_item(RecordBackButton())
+        await interaction.response.edit_message(
+            content=("✅ " if ok else "⚠️ ") + msg + (f"\n{_match_summary(v.cls, v.deck, v.is_first, v.is_win)}" if ok else ""),
+            view=back)
+
+
+class RecordDeleteButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="削除", style=discord.ButtonStyle.danger, emoji="🗑️", row=3)
+
+    async def callback(self, interaction: discord.Interaction):
+        v: RecordEditView = self.view
+        m = v.match
+        view = RecordDeleteConfirmView(v.user_id, m["id"])
+        await interaction.response.edit_message(
+            content=("🗑️ **この記録を削除しますか？**\n"
+                     f"{_match_summary(m['opp_class'], m.get('opp_deck'), bool(m['is_first']), bool(m['is_win']))}\n"
+                     f"-# 削除すると集計から外れます。{RESTORE_DAYS}日以内なら「♻️ 削除した記録を戻す」で戻せます。"),
+            view=view)
+
+
+class RecordDeleteConfirmView(discord.ui.View):
+    def __init__(self, user_id: str, match_id: int):
+        super().__init__(timeout=120)
+        self.user_id, self.match_id = user_id, match_id
+
+    @discord.ui.button(label="削除する", style=discord.ButtonStyle.danger)
+    async def do_delete(self, interaction: discord.Interaction, button: discord.ui.Button):
+        ok, msg, _ = await delete_match_checked(self.user_id, self.match_id, "discord")
+        back = discord.ui.View(timeout=120)
+        back.add_item(RecordBackButton())
+        await interaction.response.edit_message(content=("✅ " if ok else "⚠️ ") + msg, view=back)
+
+    @discord.ui.button(label="やめる", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        content, view = await build_record_list(self.user_id)
+        await interaction.response.edit_message(content=content, view=view)
+
+
+class RecordEditView(discord.ui.View):
+    def __init__(self, user_id: str, match: dict):
+        super().__init__(timeout=300)
+        self.user_id, self.match = user_id, match
+        self.cls = match["opp_class"]
+        self.deck = match.get("opp_deck") or None
+        self.is_first = bool(match["is_first"])
+        self.is_win = bool(match["is_win"])
+        self.add_item(RecordClassSelect(self.cls))
+        self.add_item(RecordDeckSelect([], self.deck))
+        self.btn_first = RecordToggleButton("is_first", True, "先攻")
+        self.btn_second = RecordToggleButton("is_first", False, "後攻")
+        self.btn_win = RecordToggleButton("is_win", True, "勝ち")
+        self.btn_lose = RecordToggleButton("is_win", False, "負け")
+        for b in (self.btn_first, self.btn_second, self.btn_win, self.btn_lose):
+            self.add_item(b)
+        self.save_btn = RecordSaveButton()
+        self.add_item(self.save_btn)
+        self.add_item(RecordDeleteButton())
+        back = RecordBackButton()
+        back.row = 3
+        self.add_item(back)
+        self.sync_buttons()
+
+    async def refresh_deck_options(self):
+        names = await get_deck_names(self.cls, 24)
+        if self.deck and self.deck not in names:
+            names = [self.deck] + names[:23]
+        for item in list(self.children):
+            if isinstance(item, RecordDeckSelect):
+                self.remove_item(item)
+        sel = RecordDeckSelect(names, self.deck)
+        self.add_item(sel)
+        # 並びを保つ（クラス→デッキ→ボタン）。add_itemは末尾なので行指定で見た目を固定している
+        self.sync_buttons()
+
+    def changed(self) -> bool:
+        m = self.match
+        return (self.cls, self.deck, self.is_first, self.is_win) != (
+            m["opp_class"], m.get("opp_deck") or None, bool(m["is_first"]), bool(m["is_win"]))
+
+    def sync_buttons(self):
+        on, off = discord.ButtonStyle.primary, discord.ButtonStyle.secondary
+        self.btn_first.style = on if self.is_first else off
+        self.btn_second.style = off if self.is_first else on
+        self.btn_win.style = on if self.is_win else off
+        self.btn_lose.style = off if self.is_win else on
+        self.save_btn.disabled = not self.changed()
+
+    def content(self) -> str:
+        m = self.match
+        before = _match_summary(m["opp_class"], m.get("opp_deck"), bool(m["is_first"]), bool(m["is_win"]))
+        after = _match_summary(self.cls, self.deck, self.is_first, self.is_win)
+        lines = ["✏️ **記録の修正**", f"変更前：{before}", f"変更後：{after}"]
+        lines.append("内容を選び直して「💾 保存」を押してください。" if self.changed() else "-# 変更すると「保存」が押せるようになります。")
+        return "\n".join(lines)
+
+
+class PanelRecordsButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="記録の確認・修正", style=discord.ButtonStyle.secondary, emoji="📋",
+                         custom_id=PANEL_RECORDS_CUSTOM_ID)
+
+    async def callback(self, interaction: discord.Interaction):
+        content, view = await build_record_list(str(interaction.user.id))
+        await interaction.response.send_message(content, view=view, ephemeral=True)
+
+
 class SensekiPanelView(discord.ui.View):
     """timeout=None＋固定custom_idで永続化。BOT再起動後もボタンが反応し続ける"""
 
@@ -3335,6 +3951,7 @@ class SensekiPanelView(discord.ui.View):
         # 1段目：記録と確認
         self.add_item(SensekiPanelButton())
         self.add_item(PanelUndoButton())
+        self.add_item(PanelRecordsButton())
         self.add_item(PanelCheckButton())
         self.add_item(PanelAIButton())
         # 2段目：設定
@@ -3961,50 +4578,330 @@ async def submit_question(client, user, cls: str, title: str, body: str, attach:
         if not (perms.view_channel and perms.send_messages):
             return False, f"{channel.mention} に投稿できる権限がありません。", None
 
-    extra = ""
+    embed = None
     if attach:
         settings = await get_user_settings(user_id)
         matches = await fetch_all_matches(env_only=True)
-        mine = [r for r in _rotation_rows(matches) if r["user_id"] == user_id]
-        parts = []
-        if settings:
-            deck = settings.get("my_deck") or "デッキ未設定"
-            rank = settings.get("rank_tier") or "ランク未設定"
-            if settings.get("cr_grade"):
-                rank += f"・{settings['cr_grade']}"
-            parts.append(f"使用：{deck}（{settings.get('my_class', '')}）／{rank}")
-        if mine:
-            w = sum(1 for r in mine if r["is_win"])
-            parts.append(f"現環境の戦績：{len(mine)}戦 勝率{w / len(mine) * 100:.0f}%")
-            vs = [r for r in mine if r["opp_class"] == cls] if cls != CONSULT_KEY else []
-            if vs:
-                vw = sum(1 for r in vs if r["is_win"])
-                parts.append(f"{cls}と当たったとき：{len(vs)}戦 勝率{vw / len(vs) * 100:.0f}%")
-        if parts:
-            extra = "\n📎 " + " ／ ".join(parts)
+        embed = build_question_embed(user_id, cls, _rotation_rows(matches), settings)
 
     safe_title = discord.utils.escape_mentions(title)[:80]
     safe_body = discord.utils.escape_mentions(body)[:800]
-    content = (f"❓ **{safe_title}**\n{safe_body}{extra}\n"
+    content = (f"❓ **{safe_title}**\n{safe_body}\n"
                f"-# 質問者：{user.mention}（戦績ツールから投稿）")
     allowed = discord.AllowedMentions(users=[user], roles=False, everyone=False)
+    kwargs = {"allowed_mentions": allowed, "view": QuestionVCView()}
+    if embed is not None:
+        kwargs["embed"] = embed
     try:
         if isinstance(channel, discord.ForumChannel):
             # フォーラムチャンネルの場合は、投稿（スレッド）として作る
-            created = await channel.create_thread(name=safe_title[:90], content=content, allowed_mentions=allowed)
+            created = await channel.create_thread(name=safe_title[:90], content=content, **kwargs)
             jump_url = created.thread.jump_url if hasattr(created, "thread") else created.jump_url
+            post_id = getattr(getattr(created, "message", None), "id", None) or getattr(getattr(created, "thread", None), "id", None)
         else:
-            message = await channel.send(content, allowed_mentions=allowed)
+            message = await channel.send(content, **kwargs)
             jump_url = message.jump_url
+            post_id = message.id
             try:
                 await message.create_thread(name=safe_title[:90], auto_archive_duration=1440)
             except discord.HTTPException:
                 pass  # スレッドを作れなくても、質問自体は投稿済み
     except discord.HTTPException as e:
         return False, f"投稿に失敗しました（{type(e).__name__}）。運営にお知らせください。", None
+    if post_id:
+        await set_state(f"{QUESTION_ASKER_KEY_PREFIX}{post_id}", user_id)   # VC予約ボタンで質問者を確認するため
     log.append(now)
     _QUESTION_LOG[user_id] = log
     return True, f"{channel.mention} に質問を投稿しました。", jump_url
+
+
+# ---- 質問の投稿に付けるデータ（相手クラス別の勝率）とVC予約 ----
+QUESTION_ASKER_KEY_PREFIX = "question_asker_"     # + 投稿のID → 質問者のユーザーID
+QUESTION_REF_GAMES = 10          # これ未満の試合数は「参考値」と表示する
+QUESTION_OTHERS_MIN = 5          # 「他の記録者」の平均を出す最低試合数
+QUESTION_GAP_MARK = 6.0          # 他の記録者との差がこれ以上なら🔴/🟢
+VC_SLOT_KEYS = ["vc1", "vc2", "vc3"]              # 質問先設定 の「相談VC①〜③」
+VC_NOTICE_KEY = "vcnotice"                        # 質問先設定 の「VC予約のお知らせ先」
+VC_NOTICE_DEFAULT = "1467189822350295213"         # VC予約を知らせるチャンネルの初期値（予定を見る場所）
+VC_RESERVE_DAILY_LIMIT = 2       # 1人が1日に予約できる回数
+VC_RESERVE_MINUTES = 60          # 1回の予約の長さ
+VC_RESERVE_DAYS = 4              # 今日から何日先まで予約できるか
+VC_START_HOURS = list(range(12, 24))               # 予約できる開始の「時」（12時〜23時）
+VC_START_MINUTES = [0, 15, 30, 45]                 # 予約できる開始の「分」（15分刻み）
+_VC_RESERVE_LOG: dict[str, list] = {}
+
+
+def _win_rate(rows: list):
+    return (sum(1 for r in rows if r["is_win"]) / len(rows) * 100) if rows else None
+
+
+def build_question_embed(user_id: str, cls: str, rows: list, settings: dict = None):
+    """質問者の戦績を、他の記録者の平均と並べて見せる枠。読む人が状況を判断するための材料"""
+    mine = [r for r in rows if r["user_id"] == user_id]
+    others = [r for r in rows if r["user_id"] != user_id]
+    lines = []
+    if settings:
+        deck = settings.get("my_deck") or "デッキ未設定"
+        rank = settings.get("rank_tier") or "ランク未設定"
+        if settings.get("cr_grade"):
+            rank += f"・{settings['cr_grade']}"
+        lines.append(f"**使用** {deck}（{settings.get('my_class', '')}）／{rank}")
+    if not mine:
+        lines.append("現環境の記録はまだありません。")
+    else:
+        total_wr = _win_rate(mine)
+        first = [r for r in mine if r.get("is_first")]
+        second = [r for r in mine if not r.get("is_first")]
+        part = f"**全体** {len(mine)}戦 {total_wr:.0f}%"
+        if first:
+            part += f"　先攻 {_win_rate(first):.0f}%（{len(first)}戦）"
+        if second:
+            part += f"　後攻 {_win_rate(second):.0f}%（{len(second)}戦）"
+        lines.append(part)
+        lines.append("")
+        lines.append("**相手クラス別の勝率**（自分 ／ 他の記録者の平均 ／ 差）")
+        by_cls: dict = {}
+        for r in mine:
+            by_cls.setdefault(r["opp_class"], []).append(r)
+        order = sorted(by_cls, key=lambda c: (c != cls, -len(by_cls[c])))[:7]
+        for c in order:
+            my_rows = by_cls[c]
+            my_wr = _win_rate(my_rows)
+            oth_rows = [r for r in others if r["opp_class"] == c]
+            oth_wr = _win_rate(oth_rows) if len(oth_rows) >= QUESTION_OTHERS_MIN else None
+            mark = "⚪"
+            diff_txt = "他の記録者のデータが少ないため比較なし"
+            if oth_wr is not None:
+                diff = my_wr - oth_wr
+                mark = "🔴" if diff <= -QUESTION_GAP_MARK else ("🟢" if diff >= QUESTION_GAP_MARK else "⚪")
+                diff_txt = f"他 {oth_wr:.0f}%（{len(oth_rows)}戦）→ **{diff:+.0f}pt**"
+            ref = " ⚠参考値" if len(my_rows) < QUESTION_REF_GAMES else ""
+            target = " ◀今回の相手" if c == cls else ""
+            lines.append(f"{mark} {c}{target}　**{my_wr:.0f}%**（{len(my_rows)}戦）{ref}　{diff_txt}")
+        recent = sorted(mine, key=lambda r: r.get("recorded_at") or "")[-10:]
+        lines.append("")
+        lines.append("**直近の試合**　" + "".join("🟢" if r["is_win"] else "🔴" for r in recent))
+    embed = discord.Embed(title="📎 質問者のデータ（現環境・ローテーション）",
+                          description="\n".join(lines)[:4000], colour=discord.Colour.blurple())
+    embed.set_footer(text=f"{QUESTION_REF_GAMES}戦未満は参考値です。「他の記録者」は質問者以外の記録者の平均です。")
+    return embed
+
+
+async def consult_vc_ids() -> list:
+    out = []
+    for k in VC_SLOT_KEYS:
+        v = await get_state(QUESTION_CHANNEL_KEY_PREFIX + k)
+        if v:
+            out.append(str(v))
+    return out
+
+
+_WEEKDAY_JA = "月火水木金土日"
+
+
+class VCReserveView(discord.ui.View):
+    """質問者が、日・時刻・VCを選んで相談の予約を入れる画面（押した人にだけ表示）"""
+
+    def __init__(self, asker_id: str, vc_options: list, question_message, title: str):
+        super().__init__(timeout=300)
+        self.asker_id = asker_id
+        self.question_message = question_message
+        self.title = title
+        self.day = None
+        self.time = None
+        self.vc = None
+        today = datetime.now(JST).date()
+        day_opts = []
+        for i in range(VC_RESERVE_DAYS):
+            d = today + timedelta(days=i)
+            tag = "今日" if i == 0 else ("明日" if i == 1 else "")
+            day_opts.append(discord.SelectOption(
+                label=f"{d.month}/{d.day}（{_WEEKDAY_JA[d.weekday()]}）{tag}".strip(), value=d.isoformat()))
+        self.hour = None
+        self.minute = None
+        hour_opts = [discord.SelectOption(label=f"{h}時", value=f"{h:02d}") for h in VC_START_HOURS]
+        minute_opts = [discord.SelectOption(label=f"{m:02d}分", value=f"{m:02d}") for m in VC_START_MINUTES]
+        self.day_sel = discord.ui.Select(placeholder="① 日にちを選ぶ", options=day_opts, row=0)
+        self.hour_sel = discord.ui.Select(placeholder="② 開始の「時」を選ぶ", options=hour_opts, row=1)
+        self.minute_sel = discord.ui.Select(placeholder="③ 開始の「分」を選ぶ（15分刻み）", options=minute_opts, row=2)
+        self.vc_sel = discord.ui.Select(
+            placeholder="④ VCを選ぶ", row=3,
+            options=[discord.SelectOption(label=name[:100], value=cid) for cid, name in vc_options])
+        self.day_sel.callback = self._on_day
+        self.hour_sel.callback = self._on_hour
+        self.minute_sel.callback = self._on_minute
+        self.vc_sel.callback = self._on_vc
+        for item in (self.day_sel, self.hour_sel, self.minute_sel, self.vc_sel):
+            self.add_item(item)
+        self.go = discord.ui.Button(label="この日時で予約する", emoji="🎤", style=discord.ButtonStyle.success, row=4)
+        self.go.callback = self._on_go
+        self.add_item(self.go)
+
+    async def _on_day(self, interaction):
+        self.day = self.day_sel.values[0]
+        await interaction.response.defer()
+
+    def _update_time(self):
+        if self.hour and self.minute:
+            self.time = f"{self.hour}:{self.minute}"
+
+    async def _on_hour(self, interaction):
+        self.hour = self.hour_sel.values[0]
+        self._update_time()
+        await interaction.response.defer()
+
+    async def _on_minute(self, interaction):
+        self.minute = self.minute_sel.values[0]
+        self._update_time()
+        await interaction.response.defer()
+
+    async def _on_vc(self, interaction):
+        self.vc = self.vc_sel.values[0]
+        await interaction.response.defer()
+
+    async def _on_go(self, interaction):
+        if not (self.day and self.time and self.vc):
+            await interaction.response.send_message("日にち・時・分・VCの4つを選んでください。", ephemeral=True)
+            return
+        await interaction.response.send_modal(VCCommentModal(self))
+
+
+class VCCommentModal(discord.ui.Modal):
+    """予約の確定前に、任意のひとことを入れる画面。空のままでも予約できる"""
+
+    def __init__(self, parent: "VCReserveView"):
+        super().__init__(title="VC相談の予約")
+        self.parent_view = parent
+        self.comment = discord.ui.TextInput(
+            label="ひとこと（任意）", required=False, max_length=100,
+            placeholder="例：音声だけでもOKです／画面共有で見てもらいたいです",
+        )
+        self.add_item(self.comment)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        p = self.parent_view
+        ok, text = await create_vc_reservation(interaction, p.asker_id, p.day, p.time, p.vc,
+                                               p.question_message, p.title, str(self.comment.value or ""))
+        if ok:
+            for item in p.children:
+                item.disabled = True
+            await interaction.response.edit_message(content=text, view=p)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+
+
+async def create_vc_reservation(interaction, asker_id: str, day: str, hhmm: str, vc_id: str,
+                                question_message, title: str, comment: str = ""):
+    """Discordの「イベント」としてVCの予約を作り、質問のスレッドに知らせる。戻り値：(成功したか, 表示する文)"""
+    import time as _time
+    guild = interaction.guild
+    if guild is None:
+        return False, "サーバー内で使ってください。"
+    now_ts = _time.time()
+    log = [t for t in _VC_RESERVE_LOG.get(asker_id, []) if now_ts - t < 86400]
+    if len(log) >= VC_RESERVE_DAILY_LIMIT:
+        return False, f"VCの予約は、1日{VC_RESERVE_DAILY_LIMIT}回までです。"
+    h, m = (int(x) for x in hhmm.split(":"))
+    d = datetime.fromisoformat(day).date()
+    start = datetime(d.year, d.month, d.day, h, m, tzinfo=JST)
+    end = start + timedelta(minutes=VC_RESERVE_MINUTES)
+    if start < datetime.now(JST) + timedelta(minutes=5):
+        return False, "5分以内、または過ぎた時刻は予約できません。もう少し先の時刻を選んでください。"
+    vc = guild.get_channel(int(vc_id))
+    if vc is None:
+        return False, "選んだVCが見つかりません。運営にお知らせください。"
+    try:
+        events = await guild.fetch_scheduled_events()
+    except discord.HTTPException:
+        events = []
+    for ev in events:
+        if getattr(ev, "channel_id", None) != vc.id:
+            continue
+        ev_end = ev.end_time or (ev.start_time + timedelta(minutes=VC_RESERVE_MINUTES))
+        if ev.start_time < end and ev_end > start:
+            ev_start = ev.start_time.astimezone(JST)
+            return False, (f"{vc.name} は、{ev_start.month}/{ev_start.day} {ev_start:%H:%M}から予約が入っています。"
+                           "別の時刻か、別のVCを選んでください。")
+    day_txt = f"{d.month}/{d.day}（{_WEEKDAY_JA[d.weekday()]}） {h}:{m:02d}〜"
+    comment = discord.utils.escape_mentions((comment or "").strip())[:100]
+    comment_line = f"\nひとこと：{comment}" if comment else ""
+    event = None
+    try:
+        event = await guild.create_scheduled_event(
+            name=f"🎤 質問の相談：{title}"[:100],
+            start_time=start, end_time=end, channel=vc,
+            description=(f"質問者：{interaction.user.display_name}\nスレッドの質問について、VCで相談します。参加したい方は「興味あり」を押してください。"
+                         + (f"\nひとこと：{comment}" if comment else ""))[:1000],
+            entity_type=discord.EntityType.voice, privacy_level=discord.PrivacyLevel.guild_only,
+        )
+    except discord.Forbidden:
+        event = None   # イベントを作る権限がないときは、スレッドへのお知らせだけにする
+    except discord.HTTPException as e:
+        return False, f"予約を作れませんでした（{type(e).__name__}）。運営にお知らせください。"
+    msg = (f"🎤 **VC相談の予約**\n日時：{day_txt}（JST）\nVC：{vc.mention}\n質問者：<@{asker_id}>{comment_line}\n"
+           "参加できる方は、イベントの「興味あり」を押すか、このスレッドに一言ください。")
+    if event is not None:
+        msg += f"\n{event.url}"
+    target = interaction.channel if isinstance(interaction.channel, discord.Thread) else getattr(question_message, "thread", None)
+    allowed = discord.AllowedMentions(users=[discord.Object(id=int(asker_id))], roles=False, everyone=False)
+    try:
+        if target is not None:
+            await target.send(msg, allowed_mentions=allowed)
+        else:
+            await question_message.reply(msg, allowed_mentions=allowed)
+    except discord.HTTPException:
+        pass
+    # 予定を見る場所（イベント機能は知らない人が多いため）にも同じ予定を出す
+    thread_url = getattr(target, "jump_url", None) or getattr(question_message, "jump_url", None)
+    notice_id = (await get_state(QUESTION_CHANNEL_KEY_PREFIX + VC_NOTICE_KEY)) or VC_NOTICE_DEFAULT
+    try:
+        notice_ch = guild.get_channel(int(notice_id)) or await interaction.client.fetch_channel(int(notice_id))
+        notice = (f"🗓️ **VC相談の予定**\n日時：{day_txt}（JST）\nVC：{vc.mention}\n"
+                  f"テーマ：{title}\n質問者：<@{asker_id}>{comment_line}")
+        await notice_ch.send(notice, allowed_mentions=discord.AllowedMentions.none())
+    except Exception as e:
+        print(f"⚠️ VC予約のお知らせを予定チャンネルに出せませんでした: {type(e).__name__}: {e}")
+    log.append(now_ts)
+    _VC_RESERVE_LOG[asker_id] = log
+    note = "" if event is not None else "\n※イベントを作る権限がないため、スレッドへのお知らせだけにしました。"
+    return True, f"✅ 予約しました：{day_txt}　{vc.mention}{note}"
+
+
+class QuestionVCView(discord.ui.View):
+    """質問の投稿に付く「VC予約」ボタン（永続ビュー）"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="VCで相談する（予約）", emoji="🎤", style=discord.ButtonStyle.success,
+                       custom_id="senseki_question_vc_v1")
+    async def reserve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        msg = interaction.message
+        asker = await get_state(f"{QUESTION_ASKER_KEY_PREFIX}{msg.id}")
+        if not asker:
+            await interaction.response.send_message("この質問の投稿者の情報が見つかりません。", ephemeral=True)
+            return
+        if str(interaction.user.id) != str(asker):
+            await interaction.response.send_message(
+                "予約できるのは質問した本人です。相談に参加したい場合は、本人が予約すると出るイベントの「興味あり」を押すか、"
+                "スレッドに書き込んでください。", ephemeral=True)
+            return
+        vc_ids = await consult_vc_ids()
+        options = []
+        for cid in vc_ids:
+            ch = interaction.guild.get_channel(int(cid)) if interaction.guild else None
+            if ch is not None:
+                options.append((cid, ch.name))
+        if not options:
+            await interaction.response.send_message("相談用のVCがまだ設定されていません。運営にお知らせください。",
+                                                    ephemeral=True)
+            return
+        first_line = (msg.content or "").split("\n")[0].replace("❓", "").replace("*", "").strip()
+        view = VCReserveView(str(asker), options, msg, first_line or "質問")
+        await interaction.response.send_message(
+            "🎤 **VCで相談する日時を選んでください**（今日から4日先まで）\n"
+            "予約すると、Discordの「イベント」が作られ、スレッドにお知らせが出ます。", view=view, ephemeral=True)
+
 
 
 async def post_question(interaction: discord.Interaction, cls: str, title: str, body: str, attach: bool):
@@ -4071,7 +4968,7 @@ class QuestionClassSelect(discord.ui.Select):
         view.add_item(QuestionWriteButton(cls, attach=False))
         await interaction.response.edit_message(
             content=(f"{target}に投稿します。\n"
-                     "📎 戦績を添付すると、あなたの使用デッキ・ランク・現環境の勝率が質問に添えられます（答えが付きやすくなります）。"),
+                     "📎 戦績を添付すると、使用デッキ・ランク・相手クラス別の勝率（他の記録者の平均との差つき）が質問に添えられます。答えが付きやすくなります。"),
             view=view,
         )
 
@@ -4190,6 +5087,7 @@ class SensekiCog(commands.Cog):
         self.bot.add_view(SensekiPanelView())
         self.bot.add_view(LegacyPanelView())
         self.bot.add_view(HintPostView())
+        self.bot.add_view(QuestionVCView())
         # Webページ（senseki_web.py があり WEB_SESSION_SECRET が設定されているときだけ起動）
         try:
             from senseki_web import start_web
@@ -4263,6 +5161,7 @@ class SensekiCog(commands.Cog):
                     "\n"
                     "**記録・確認**\n"
                     "・⚔️ 戦績を記録する　・↩️ 直前の記録を取消\n"
+                    "・📋 記録の確認・修正（過去の記録を見て、修正・削除。削除しても7日以内なら戻せます）\n"
                     "・📊 成績・弱点（通算・直近の成績と、勝率が低い対面）\n"
                     "・🤖 AIで分析（今のデッキの記録をAIが読み解く。1日1回）\n"
                     "\n"
@@ -4679,6 +5578,71 @@ class SensekiCog(commands.Cog):
             + note,
             ephemeral=True,
         )
+
+    @admin.command(name="記録管理", description="記録の修正・削除の履歴確認と、削除された記録の復元（管理者のみ）")
+    @app_commands.describe(
+        操作="履歴＝ユーザー別の修正・削除状況／削除済み＝指定した人が削除した記録とID／復元＝IDを指定して戻す",
+        ユーザー="「削除済み」で、確認する人",
+        記録id="「復元」で、戻す記録のID（「削除済み」で確認できます）",
+        日数="「履歴」でさかのぼる日数（デフォルト7日）",
+    )
+    @app_commands.choices(操作=[
+        app_commands.Choice(name="履歴（ユーザー別の修正・削除状況）", value="history"),
+        app_commands.Choice(name="削除済み（指定した人の削除した記録）", value="deleted"),
+        app_commands.Choice(name="復元（IDを指定して戻す）", value="restore"),
+    ])
+    async def record_admin_cmd(
+        self, interaction: discord.Interaction, 操作: app_commands.Choice[str],
+        ユーザー: discord.Member = None, 記録id: int = None,
+        日数: app_commands.Range[int, 1, 60] = 7,
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        none = discord.AllowedMentions.none()
+        if 操作.value == "history":
+            report = await edit_report(日数)
+            if not report:
+                await interaction.followup.send(f"直近{日数}日に、修正・削除・取消はありませんでした。", ephemeral=True)
+                return
+            rows = sorted(report.items(), key=lambda kv: -(kv[1]["edit"] + kv[1]["delete"]))
+            lines = [f"🔎 **記録の修正・削除（直近{日数}日）**",
+                     "-# ⚠️は、削除が10件以上／負けの削除が5件以上／負→勝への修正が3件以上のどれかです。"]
+            for uid, u in rows[:20]:
+                warn = u["delete"] >= 10 or u["del_lose"] >= 5 or u["to_win"] >= 3
+                lines.append(
+                    f"{'⚠️ ' if warn else ''}<@{uid}>：修正{u['edit']}（負→勝{u['to_win']}）／削除{u['delete']}（うち負け{u['del_lose']}）"
+                    f"／取消{u['undo']}／復元{u['restore']}" + ("／Web経由あり" if u["web"] else ""))
+            if len(rows) > 20:
+                lines.append(f"…ほか{len(rows) - 20}名")
+            await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True, allowed_mentions=none)
+        elif 操作.value == "deleted":
+            if ユーザー is None:
+                await interaction.followup.send("「ユーザー」を指定してください。", ephemeral=True)
+                return
+
+            def _q():
+                conn = _connect()
+                try:
+                    return [dict(r) for r in conn.execute(
+                        "SELECT * FROM matches_deleted WHERE user_id = ? ORDER BY deleted_at DESC LIMIT 15",
+                        (str(ユーザー.id),)).fetchall()]
+                finally:
+                    conn.close()
+
+            rows = await asyncio.to_thread(_q)
+            if not rows:
+                await interaction.followup.send("削除された記録はありません。", ephemeral=True)
+                return
+            lines = [f"🗑️ **{ユーザー.display_name} さんの削除済み記録**（新しい順）"]
+            for r in rows:
+                lines.append(f"・ID **{r['id']}**｜{_match_label(r)}｜削除 {r['deleted_at'][5:16].replace('T', ' ')}")
+            lines.append("-# 戻すには、操作「復元」にIDを入れてください。")
+            await interaction.followup.send("\n".join(lines)[:1900], ephemeral=True, allowed_mentions=none)
+        else:
+            if 記録id is None:
+                await interaction.followup.send("「記録id」を指定してください。", ephemeral=True)
+                return
+            ok, msg, _ = await restore_match("", 記録id, "admin", admin=True)
+            await interaction.followup.send(("✅ " if ok else "⚠️ ") + msg, ephemeral=True)
 
     @admin.command(name="診断", description="データの保存先と永続化状況を確認します")
     async def storage_diag(self, interaction: discord.Interaction):
@@ -5693,12 +6657,33 @@ class SensekiCog(commands.Cog):
         await interaction.response.send_message("⏸ 質問のヒントの自動投稿を止めました。", ephemeral=True)
 
     @admin.command(name="質問先設定", description="クラス別の質問の投稿先チャンネルを設定します")
-    @app_commands.describe(クラス="対象クラス（デッキ選びの相談は「シャドバ相談所」）", チャンネル="質問を投稿するチャンネル")
+    @app_commands.describe(クラス="対象クラス（デッキ選びの相談は「シャドバ相談所」、VCの予約に使うVCは「相談VC①〜③」）",
+                           チャンネル="質問を投稿するチャンネル（相談VCのときはボイスチャンネル）")
     @app_commands.choices(クラス=[app_commands.Choice(name=c, value=c) for c in CLASS_CHOICES]
-                          + [app_commands.Choice(name="シャドバ相談所", value=CONSULT_KEY)])
+                          + [app_commands.Choice(name="シャドバ相談所", value=CONSULT_KEY)]
+                          + [app_commands.Choice(name=f"相談VC{n}", value=k)
+                             for n, k in zip("①②③", VC_SLOT_KEYS)]
+                          + [app_commands.Choice(name="VC予約のお知らせ先", value=VC_NOTICE_KEY)])
     async def question_channel_setup(self, interaction: discord.Interaction,
-                                     クラス: app_commands.Choice[str], チャンネル: discord.TextChannel):
+                                     クラス: app_commands.Choice[str],
+                                     チャンネル: Union[discord.TextChannel, discord.ForumChannel, discord.VoiceChannel]):
+        is_vc_slot = クラス.value in VC_SLOT_KEYS
+        if is_vc_slot != isinstance(チャンネル, discord.VoiceChannel):
+            await interaction.response.send_message(
+                "相談VCにはボイスチャンネルを、クラス・シャドバ相談所にはテキスト（またはフォーラム）チャンネルを選んでください。",
+                ephemeral=True)
+            return
         await set_state(QUESTION_CHANNEL_KEY_PREFIX + クラス.value, str(チャンネル.id))
+        if クラス.value == VC_NOTICE_KEY:
+            await interaction.response.send_message(
+                f"✅ VC予約のお知らせを {チャンネル.mention} に出すように設定しました。", ephemeral=True)
+            return
+        if is_vc_slot:
+            await interaction.response.send_message(
+                f"✅ **{クラス.name}** を {チャンネル.mention} に設定しました。質問の「🎤 VCで相談する（予約）」で選べます。\n"
+                "-# BOTに「イベントの作成」権限があると、Discordのイベントとして予約されます（なくてもスレッドへのお知らせは出ます）。",
+                ephemeral=True)
+            return
         await interaction.response.send_message(
             f"✅ **{クラス.name}** の質問先を {チャンネル.mention} に設定しました。\n"
             "-# BOTに、そのチャンネルの「メッセージを送信」「公開スレッドを作成」の権限が必要です。",
@@ -5770,12 +6755,25 @@ class SensekiCog(commands.Cog):
 
         await set_state(state_key, today)
         await log_command_usage(user_id, "AI個人分析")
-        await interaction.followup.send(
+        improve = compute_improve_rows(mine, everyone)
+        chart = None
+        if improve is not None:
+            chart = await asyncio.to_thread(render_improve_chart, settings["my_deck"], improve)
+        body = (
             f"🤖 **{settings['my_deck']}のAI分析**（あなたの記録{len(mine)}戦・同じデッキのほかの人{len(everyone)}戦と比較）\n"
             f"{text[:1400]}\n"
-            f"{ENV_REPORT_AI_DISCLAIMER}",
-            ephemeral=True,
         )
+        if chart is not None:
+            body += "📉 **もう少し勝率を上げたい対面**を、下の画像にまとめました。\n"
+        elif improve is None:
+            body += f"📉 平均より勝率が低く、{IMPROVE_MIN_GAMES}戦以上当たっている対面は、今のところありません。\n"
+        body += ENV_REPORT_AI_DISCLAIMER
+        if chart is not None:
+            await interaction.followup.send(
+                body, file=discord.File(chart, filename="improve_matchups.png"), ephemeral=True
+            )
+        else:
+            await interaction.followup.send(body, ephemeral=True)
 
     # ---- /弱点対面 ----
     # SENSEKI_MEMBERS_ONLY が true になるまで①②とも誰でも使える（コマンド自体の公開範囲）。
