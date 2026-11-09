@@ -4720,6 +4720,25 @@ async def _save_vc_reservations(items: list):
     await set_state(VC_RES_STATE_KEY, json.dumps(items, ensure_ascii=False))
 
 
+
+def _missing_event_perms(guild, vc) -> list:
+    """BOTがVCのイベントを作るのに足りない権限を調べる（VCの「見る・接続・発言」と、イベントの作成／管理）"""
+    me = getattr(guild, "me", None)
+    if me is None or not hasattr(vc, "permissions_for"):
+        return []
+    p = vc.permissions_for(me)
+    missing = []
+    for attr, label in (("view_channel", "VCの「チャンネルを見る」"), ("connect", "VCの「接続」"),
+                        ("speak", "VCの「発言」")):
+        if not getattr(p, attr, True):
+            missing.append(label)
+    gp = getattr(me, "guild_permissions", None)
+    if gp is not None and not (getattr(gp, "manage_events", False) or getattr(gp, "create_events", False)
+                               or getattr(p, "manage_events", False)):
+        missing.append("「イベントを管理」（または「イベントを作成」）")
+    return missing
+
+
 class VCReserveView(discord.ui.View):
     """質問者が、日・時刻・VCを選んで相談の予約を入れる画面（押した人にだけ表示）"""
 
@@ -4812,14 +4831,21 @@ class VCCommentModal(discord.ui.Modal):
         title = p.title
         if self.theme is not None:
             title = discord.utils.escape_mentions(str(self.theme.value or "").strip()) or "VC"
-        ok, text = await create_vc_reservation(interaction, p.asker_id, p.day, p.time, p.vc,
-                                               p.question_message, title, str(self.comment.value or ""))
+        # 予約の処理（イベント作成・お知らせ投稿）は3秒を超えることがあるため、先に受け付けを返す
+        await interaction.response.defer()
+        try:
+            ok, text = await create_vc_reservation(interaction, p.asker_id, p.day, p.time, p.vc,
+                                                   p.question_message, title, str(self.comment.value or ""))
+        except Exception as e:
+            print(f"⚠️ VC予約でエラー: {type(e).__name__}: {e}")
+            await interaction.followup.send("予約の処理でエラーが出ました。運営にお知らせください。", ephemeral=True)
+            return
         if ok:
             for item in p.children:
                 item.disabled = True
-            await interaction.response.edit_message(content=text, view=p)
+            await interaction.edit_original_response(content=text, view=p)
         else:
-            await interaction.response.send_message(text, ephemeral=True)
+            await interaction.followup.send(text, ephemeral=True)
 
 
 async def create_vc_reservation(interaction, asker_id: str, day: str, hhmm: str, vc_id: str,
@@ -4883,6 +4909,7 @@ async def create_vc_reservation(interaction, asker_id: str, day: str, hhmm: str,
     comment = discord.utils.escape_mentions((comment or "").strip())[:100]
     comment_line = f"\nひとこと：{comment}" if comment else ""
     event = None
+    event_hint = ""
     try:
         event = await guild.create_scheduled_event(
             name=(f"🎤 質問の相談：{title}" if question_message is not None else f"🎤 VC：{title}")[:100],
@@ -4893,8 +4920,14 @@ async def create_vc_reservation(interaction, asker_id: str, day: str, hhmm: str,
                          + (f"\nひとこと：{comment}" if comment else ""))[:1000],
             entity_type=discord.EntityType.voice, privacy_level=discord.PrivacyLevel.guild_only,
         )
-    except discord.Forbidden:
-        event = None   # イベントを作る権限がないときは、スレッドへのお知らせだけにする
+    except discord.Forbidden as e:
+        event = None   # イベントを作る権限がないときは、お知らせだけにする
+        missing = _missing_event_perms(guild, vc)
+        print(f"⚠️ VCイベントを作れませんでした（Forbidden code={getattr(e, 'code', None)} text={getattr(e, 'text', '')}）"
+              f" 不足の可能性：{missing or '不明'}")
+        perm = getattr(interaction.user, "guild_permissions", None)
+        if perm is not None and perm.administrator:    # 管理者にだけ、足りない権限を知らせる
+            event_hint = "／".join(missing) if missing else "（BOTのロールとVCの権限設定を確認してください）"
     except discord.HTTPException as e:
         return False, f"予約を作れませんでした（{type(e).__name__}）。運営にお知らせください。"
     msg = (f"🎤 **VC相談の予約**\n日時：{day_txt}（JST）\nVC：{vc.mention}\n質問者：<@{asker_id}>{comment_line}\n"
@@ -4931,7 +4964,9 @@ async def create_vc_reservation(interaction, asker_id: str, day: str, hhmm: str,
         print(f"⚠️ VC予約の控えを保存できませんでした: {type(e).__name__}: {e}")
     log.append(now_ts)
     _VC_RESERVE_LOG[asker_id] = log
-    note = "" if event is not None else "\n※イベントを作る権限がないため、お知らせだけにしました。"
+    note = "" if event is not None else (
+        "\n※イベントを作る権限がないため、お知らせだけにしました。"
+        + (f"\n（管理者向け：BOTに不足している権限 → {event_hint}）" if event_hint else ""))
     return True, f"✅ 予約しました：{day_txt}　{vc.mention}{note}"
 
 
