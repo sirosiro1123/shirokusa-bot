@@ -3960,6 +3960,7 @@ class SensekiPanelView(discord.ui.View):
         # 質問・相談（ヒント、クラス別チャンネル・シャドバ相談所への質問）
         self.add_item(PanelHintButton())
         self.add_item(PanelAskButton())
+        self.add_item(PanelVCButton())
 
 
 class LegacyPanelView(discord.ui.View):
@@ -4775,8 +4776,14 @@ class VCCommentModal(discord.ui.Modal):
     """予約の確定前に、任意のひとことを入れる画面。空のままでも予約できる"""
 
     def __init__(self, parent: "VCReserveView"):
-        super().__init__(title="VC相談の予約")
+        super().__init__(title="VCの予約")
         self.parent_view = parent
+        self.theme = None
+        if parent.question_message is None:      # 質問に紐づかない、直接のVC予約
+            self.theme = discord.ui.TextInput(
+                label="テーマ（何をしますか）", required=True, max_length=60,
+                placeholder="例：ロイヤルの対策を相談したい／ランクマの練習")
+            self.add_item(self.theme)
         self.comment = discord.ui.TextInput(
             label="ひとこと（任意）", required=False, max_length=100,
             placeholder="例：音声だけでもOKです／画面共有で見てもらいたいです",
@@ -4785,8 +4792,11 @@ class VCCommentModal(discord.ui.Modal):
 
     async def on_submit(self, interaction: discord.Interaction):
         p = self.parent_view
+        title = p.title
+        if self.theme is not None:
+            title = discord.utils.escape_mentions(str(self.theme.value or "").strip()) or "VC"
         ok, text = await create_vc_reservation(interaction, p.asker_id, p.day, p.time, p.vc,
-                                               p.question_message, p.title, str(self.comment.value or ""))
+                                               p.question_message, title, str(self.comment.value or ""))
         if ok:
             for item in p.children:
                 item.disabled = True
@@ -4849,9 +4859,11 @@ async def create_vc_reservation(interaction, asker_id: str, day: str, hhmm: str,
     event = None
     try:
         event = await guild.create_scheduled_event(
-            name=f"🎤 質問の相談：{title}"[:100],
+            name=(f"🎤 質問の相談：{title}" if question_message is not None else f"🎤 VC：{title}")[:100],
             start_time=start, end_time=end, channel=vc,
-            description=(f"質問者：{interaction.user.display_name}\nスレッドの質問について、VCで相談します。参加したい方は「興味あり」を押してください。"
+            description=((f"質問者：{interaction.user.display_name}\nスレッドの質問について、VCで相談します。参加したい方は「興味あり」を押してください。"
+                          if question_message is not None else
+                          f"予約者：{interaction.user.display_name}\n参加したい方は「興味あり」を押してください。")
                          + (f"\nひとこと：{comment}" if comment else ""))[:1000],
             entity_type=discord.EntityType.voice, privacy_level=discord.PrivacyLevel.guild_only,
         )
@@ -4863,28 +4875,32 @@ async def create_vc_reservation(interaction, asker_id: str, day: str, hhmm: str,
            "参加できる方は、イベントの「興味あり」を押すか、このスレッドに一言ください。")
     if event is not None:
         msg += f"\n{event.url}"
-    target = interaction.channel if isinstance(interaction.channel, discord.Thread) else getattr(question_message, "thread", None)
-    allowed = discord.AllowedMentions(users=[discord.Object(id=int(asker_id))], roles=False, everyone=False)
-    try:
-        if target is not None:
-            await target.send(msg, allowed_mentions=allowed)
-        else:
-            await question_message.reply(msg, allowed_mentions=allowed)
-    except discord.HTTPException:
-        pass
+    target = None
+    if question_message is not None:     # 質問への予約のときだけ、スレッドにも知らせる
+        target = interaction.channel if isinstance(interaction.channel, discord.Thread) else getattr(question_message, "thread", None)
+        allowed = discord.AllowedMentions(users=[discord.Object(id=int(asker_id))], roles=False, everyone=False)
+        try:
+            if target is not None:
+                await target.send(msg, allowed_mentions=allowed)
+            else:
+                await question_message.reply(msg, allowed_mentions=allowed)
+        except discord.HTTPException:
+            pass
     # 予定を見る場所（イベント機能は知らない人が多いため）にも同じ予定を出す
     thread_url = getattr(target, "jump_url", None) or getattr(question_message, "jump_url", None)
     notice_id = (await get_state(QUESTION_CHANNEL_KEY_PREFIX + VC_NOTICE_KEY)) or VC_NOTICE_DEFAULT
     try:
         notice_ch = guild.get_channel(int(notice_id)) or await interaction.client.fetch_channel(int(notice_id))
         notice = (f"🗓️ **VC相談の予定**\n日時：{day_txt}（JST）\nVC：{vc.mention}\n"
-                  f"テーマ：{title}\n質問者：<@{asker_id}>{comment_line}")
+                  f"テーマ：{title}\n質問者：<@{asker_id}>{comment_line}") if question_message is not None else (
+                  f"🗓️ **VCの予定**\n日時：{day_txt}（JST）\nVC：{vc.mention}\n"
+                  f"テーマ：{title}\n予約者：<@{asker_id}>{comment_line}")
         await notice_ch.send(notice, allowed_mentions=discord.AllowedMentions.none())
     except Exception as e:
         print(f"⚠️ VC予約のお知らせを予定チャンネルに出せませんでした: {type(e).__name__}: {e}")
     log.append(now_ts)
     _VC_RESERVE_LOG[asker_id] = log
-    note = "" if event is not None else "\n※イベントを作る権限がないため、スレッドへのお知らせだけにしました。"
+    note = "" if event is not None else "\n※イベントを作る権限がないため、お知らせだけにしました。"
     return True, f"✅ 予約しました：{day_txt}　{vc.mention}{note}"
 
 
@@ -4923,6 +4939,23 @@ class QuestionVCView(discord.ui.View):
             "🎤 **VCで相談する日時を選んでください**（今日から4日先まで・1人2時間確保・先着順）\n"
             "予約すると、Discordの「イベント」が作られ、スレッドにお知らせが出ます。", view=view, ephemeral=True)
 
+
+
+async def start_direct_vc(interaction: discord.Interaction):
+    """質問に紐づかないVC予約の入口（パネル・ヒントのボタンから）。押した人にだけ画面を出す"""
+    vc_ids = await consult_vc_ids()
+    options = []
+    for cid in vc_ids:
+        ch = interaction.guild.get_channel(int(cid)) if interaction.guild else None
+        if ch is not None:
+            options.append((cid, ch.name))
+    if not options:
+        await interaction.response.send_message("相談用のVCが見つかりません。運営にお知らせください。", ephemeral=True)
+        return
+    view = VCReserveView(str(interaction.user.id), options, None, "")
+    await interaction.response.send_message(
+        "🎤 **VCを予約します**（今日から4日先まで・1人2時間確保・先着順）\n"
+        "日時とVCを選ぶと、Discordの「イベント」になり、予定のチャンネルにもお知らせが出ます。", view=view, ephemeral=True)
 
 
 async def post_question(interaction: discord.Interaction, cls: str, title: str, body: str, attach: bool):
@@ -4996,6 +5029,7 @@ class QuestionClassSelect(discord.ui.Select):
 
 PANEL_HINT_CUSTOM_ID = "senseki_panel_hint_v1"
 PANEL_ASK_CUSTOM_ID = "senseki_panel_ask_v1"
+PANEL_VC_CUSTOM_ID = "senseki_panel_vc_v1"
 
 
 async def show_personal_hint(interaction: discord.Interaction):
@@ -5033,6 +5067,15 @@ class PanelAskButton(discord.ui.Button):
         await start_question_flow(interaction)
 
 
+class PanelVCButton(discord.ui.Button):
+    def __init__(self):
+        super().__init__(label="VC予約", style=discord.ButtonStyle.success, emoji="🎤",
+                         custom_id=PANEL_VC_CUSTOM_ID)
+
+    async def callback(self, interaction: discord.Interaction):
+        await start_direct_vc(interaction)
+
+
 class HintPostView(discord.ui.View):
     """毎週金曜の「質問のヒント」投稿に付くボタン（永続ビュー）"""
 
@@ -5048,6 +5091,11 @@ class HintPostView(discord.ui.View):
                        custom_id="senseki_hint_ask")
     async def ask(self, interaction: discord.Interaction, button: discord.ui.Button):
         await start_question_flow(interaction)
+
+    @discord.ui.button(label="VCを予約する", emoji="🎤", style=discord.ButtonStyle.success,
+                       custom_id="senseki_hint_vc")
+    async def reserve_vc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await start_direct_vc(interaction)
 
 
 class SensekiCog(commands.Cog):
@@ -5192,7 +5240,8 @@ class SensekiCog(commands.Cog):
                     "\n"
                     "**質問・相談**\n"
                     "・🎯 質問のヒント（あなたの記録から、聞いてみるとよさそうな相手とおすすめのチャンネルを表示）\n"
-                    "・❓ 質問・相談する（クラス別チャンネル／使うデッキの相談はシャドバ相談所へ投稿）\n"
+                    "・❓ 質問・相談する（クラス別チャンネル／使うデッキの相談はシャドバ相談所へ投稿。戦績の添付もできます）\n"
+                    "・🎤 VC予約（シャドバビヨンドVC／VC2を、先着順・1人2時間で予約。予定のチャンネルにもお知らせが出ます）\n"
                     "\n"
                     "**⚠️ 記録の前に確認してください**\n"
                     "記録画面の上部に、今のあなたのデッキとランクが表示されます。\n"
